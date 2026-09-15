@@ -90,6 +90,7 @@ Unturned 服务器默认不带 Rocket。到「服务器设置」页底部的 **R
 - 中文内容按文件原编码（UTF-8 / GBK 自动检测）保存，不会乱码。
 - 以后往 `Servers\<你的存档>\Rocket\Plugins` 放插件，插件的配置文件会自动出现在「文件管理」里。
 - 想开多个服务器：在向导（侧边栏底部「切换/重设」）里创建多个存档，端口会自动错开。
+- This project is licensed under the MIT License - see the LICENSE file for details
 
 ## 发给朋友前
 
