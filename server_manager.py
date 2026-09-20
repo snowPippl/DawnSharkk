@@ -3,14 +3,16 @@
 Unturned 服务器开服器 (本地网页版 · 萌新友好版)
 - 首次启动在网页里选择游戏目录与存档(实例), 之后自动记住
 - 功能: 开服/安全关服/重启、控制台(实时日志+Server Code 抓取+发送命令+报错高亮)、
-        傻瓜式一键设置(死亡不掉落/建筑无敌/车辆无敌等)、Commands.dat / Config.txt 汉化编辑、
-        创意工坊模组、全部配置文件(含 Rocket 插件)读取与修改、明/暗主题切换
+        傻瓜式一键设置(死亡不掉落/建筑无敌/车辆无敌/免道具看地图等)、Commands.dat / Config.txt 汉化编辑、
+        服务器图标与大厅链接(图床)、Rocket 指令反馈汉化、
+        创意工坊模组、建筑与玩家存档备份/删除(删前强制备份)、全部配置文件(含 Rocket 插件)读取与修改、明/暗主题切换
 - 纯 Python 标准库, 自带免安装 Python, 双击 启动开服器.bat 即用
 """
 import json
 import os
 import random
 import re
+import shutil
 import signal
 import socket
 import string
@@ -20,12 +22,28 @@ import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote, urlencode
+import urllib.error
+import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 OPLOG_PATH = os.path.join(BASE_DIR, "操作日志.txt")
 HOST, PORT = "127.0.0.1", 8787
+VERSION = "0.1.8"            # 发布版本号: 改这里 + 新增 更新内容-版本号.md + 跑 发布打包.bat
+
+# 项目仓库: 侧边栏只显示 GitHub 图标 + 名称, 不把网址写在页面上
+REPO_URL = "https://github.com/snowPippl/DawnSharkk"
+# GitHub 图标路径来自 CC0 的 simple-icons (内联使用, 保持离线可用)
+GH_ICON = ('<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 '
+           '0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724'
+           '-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729'
+           ' 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305'
+           '.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523'
+           '.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28'
+           '-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61'
+           '-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69'
+           '.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>')
 
 ALLOWED_EXT = {".dat", ".txt", ".json", ".xml", ".cfg", ".ini"}
 
@@ -170,8 +188,12 @@ def read_file(path):
 
 
 def write_file(path, text):
-    with open(path, "rb") as f:
-        enc = detect_encoding(f.read())
+    try:
+        with open(path, "rb") as f:
+            enc = detect_encoding(f.read())
+    except FileNotFoundError:
+        enc = "utf-8"          # 新存档还没生成该文件时, 由开服器创建
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     if text and not text.endswith("\n"):
         text += "\n"
     with open(path, "w", encoding=enc, newline="") as f:
@@ -303,6 +325,162 @@ def get_cfg(path, section, key):
     return None
 
 
+# ================================================= 服务器图标 / 大厅链接 (Config.txt 的 Browser 段)
+BROWSER_DEFAULTS = {
+    "icon": "https://s41.ax1x.com/2026-07-16/pmyJTMR.jpg",
+    "thumb": "https://s41.ax1x.com/2026-07-16/pmyJIz9.jpg",
+    "links": [("欢迎使用DawnSharkk", "https://github.com/snowPippl/DawnSharkk")],
+}
+BROWSER_SEC = ("Browser",)
+
+
+def _links_raws(links, indent="\t"):
+    out = [indent + "Links", indent + "["]
+    for msg, url in links:
+        out += [indent + "\t{", indent + "\t\tMessage " + msg,
+                indent + "\t\tURL " + url, indent + "\t}"]
+    out.append(indent + "]")
+    return out
+
+
+def _parse_links(raws):
+    links, msg, url = [], None, None
+    for r in raws:
+        s = r.strip()
+        if s.startswith("Message"):
+            msg = s[len("Message"):].strip()
+        elif s.startswith("URL"):
+            url = s[len("URL"):].strip()
+        elif s == "}":
+            if url:
+                links.append((msg or "", url))
+            msg = url = None
+    return links
+
+
+def _browser_setting(key, value):
+    return {"type": "setting", "key": key, "value": value,
+            "indent": "\t", "section": BROWSER_SEC}
+
+
+def parse_link_lines(text):
+    """每行一条链接: 「文字 | 网址」; 没有 | 时按最后一个空格切分"""
+    out = []
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        if "|" in ln:
+            msg, url = ln.split("|", 1)
+        else:
+            parts = ln.rsplit(" ", 1)
+            msg, url = (parts if len(parts) == 2 else ("", parts[0]))
+        msg, url = msg.strip()[:60], url.strip()[:300]
+        if url.startswith("http://") or url.startswith("https://"):
+            out.append((msg or url, url))
+    return out[:8]
+
+
+def browser_cfg(path=None):
+    """读当前存档 Config.txt 的 Browser 段 (未设置的返回空)"""
+    p = path or config_txt()
+    info = {"icon": "", "thumb": "", "links": []}
+    try:
+        _ensure_cfg_file(p)
+        text, _ = read_file(p)
+    except OSError:
+        return info
+    for it in parse_cfg(text):
+        if it.get("section") != BROWSER_SEC:
+            continue
+        if it["type"] == "setting":
+            k = it["key"].lower()
+            if k == "icon":
+                info["icon"] = it["value"] or ""
+            elif k == "thumbnail":
+                info["thumb"] = it["value"] or ""
+        elif it["type"] == "block" and it["key"].lower() == "links":
+            info["links"] = _parse_links(it["raws"])
+    return info
+
+
+def set_browser_cfg(icon, thumb, links, path=None):
+    """写入 Browser 段 Icon / Thumbnail / Links; 传空表示恢复游戏默认(不设置)"""
+    p = path or config_txt()
+    _ensure_cfg_file(p)
+    text, _ = read_file(p)
+    items = parse_cfg(text)
+    found = {"icon": False, "thumb": False, "links": False}
+    for i, it in enumerate(items):
+        if it.get("section") != BROWSER_SEC:
+            continue
+        if it["type"] == "setting":
+            k = it["key"].lower()
+            if k == "icon":
+                it["value"] = icon or None
+                found["icon"] = True
+            elif k == "thumbnail":
+                it["value"] = thumb or None
+                found["thumb"] = True
+            elif k == "links":
+                items[i] = (_browser_setting("Links", None) if not links
+                            else {"type": "block", "key": "Links",
+                                  "section": BROWSER_SEC, "raws": _links_raws(links)})
+                found["links"] = True
+        elif it["type"] == "block" and it["key"].lower() == "links":
+            if links:
+                it["raws"] = _links_raws(links)
+            else:
+                items[i] = _browser_setting("Links", None)
+            found["links"] = True
+    todo = []
+    if not found["icon"]:
+        todo.append(_browser_setting("Icon", icon or None))
+    if not found["thumb"]:
+        todo.append(_browser_setting("Thumbnail", thumb or None))
+    if not found["links"]:
+        todo.append(_browser_setting("Links", None) if not links else
+                    {"type": "block", "key": "Links", "section": BROWSER_SEC,
+                     "raws": _links_raws(links)})
+    if todo:
+        head = next((i for i, it in enumerate(items)
+                     if it["type"] == "sectopen" and it["key"] == "Browser"), None)
+        if head is None:
+            items.append({"type": "sectopen", "raw": "Browser", "key": "Browser"})
+            items.append({"type": "brace", "raw": "{"})
+            items.extend(todo)
+            items.append({"type": "brace", "raw": "}"})
+            items.append({"type": "other", "raw": ""})
+        else:
+            at = head + 1
+            if at < len(items) and items[at]["type"] == "brace":
+                at += 1
+            items[at:at] = todo
+    write_file(p, build_cfg(items))
+    return True
+
+
+def apply_browser_defaults(name=None, path=None):
+    """每个存档第一次被打开时写入 Dawn Sharkk 默认服务器图标与大厅链接;
+    之后用户自己清空/改动不再自动补, 以免覆盖他的选择"""
+    inst = name or instance()
+    done = _settings.get("browser_defaults_done") or []
+    if not inst or inst in done:
+        return False
+    p = path or os.path.join(game_dir(), "Servers", inst, "Config.txt")
+    cur = browser_cfg(p)
+    icon = cur["icon"] or BROWSER_DEFAULTS["icon"]
+    thumb = cur["thumb"] or BROWSER_DEFAULTS["thumb"]
+    links = cur["links"] or list(BROWSER_DEFAULTS["links"])
+    if (icon, thumb, links) == (cur["icon"], cur["thumb"], cur["links"]):
+        return False
+    set_browser_cfg(icon, thumb, links, p)
+    done.append(inst)
+    _settings["browser_defaults_done"] = done
+    save_settings()
+    return True
+
+
 # ================================================================ 傻瓜式开关定义
 TOGGLES = [
     {"id": "keep_inventory", "icon": "🎒", "name": "死亡不掉落",
@@ -343,6 +521,15 @@ TOGGLES = [
     {"id": "max_skills", "icon": "⭐", "name": "出生满技能",
      "desc": "新玩家进入服务器时所有技能直接满级",
      "keys": [("Players", "Spawn_With_Max_Skills", "True")]},
+    {"id": "free_compass", "icon": "🧭", "name": "无需指南针即可显示方向",
+     "desc": "玩家不用捡指南针, 屏幕上一直显示自己的朝向(北/东/南/西), 萌新不再迷路",
+     "keys": [("Gameplay", "Compass", "True")]},
+    {"id": "free_satellite", "icon": "🛰️", "name": "无需GPS即可开启卫星地图",
+     "desc": "玩家不用捡 GPS 物品, 打开地图就能看卫星地图(全图)",
+     "keys": [("Gameplay", "Satellite", "True")]},
+    {"id": "free_chart", "icon": "🗺️", "name": "无需手绘地图即可开启手绘地图",
+     "desc": "玩家不用捡纸质/手绘地图物品, 打开地图就能看手绘地图(建筑轮廓那张)",
+     "keys": [("Gameplay", "Chart", "True")]},
 ]
 
 SELECTS = [
@@ -471,11 +658,51 @@ for _s in SELECTS:
 for _sec, _cn, _fields in GAMEPLAY_FIELDS:
     for _f in _fields:
         _collect_cfg_key(_sec, _f[0])
+for _k in ("Icon", "Thumbnail", "Links"):
+    _collect_cfg_key("Browser", _k)
 
 
-def default_commands_text(name, port):
-    return (f"name {name}\nMap PEI\nMaxplayers 24\nPort {port}\nMode normal\n"
-            f"perspective both\nWelcome 欢迎来到我的服务器!\n//PVE 或 PVP\nPVE\n")
+DEFAULT_WELCOME = ("欢迎使用DawnSharkk开服器 github仓库地址"
+                   "https://github.com/snowPippl/DawnSharkk "
+                   "如果好用请帮忙点击一个star哦~！游戏愉快~~")
+
+
+def default_commands_text(name, port, cheat=True):
+    txt = (f"name {name}\nMap PEI\nMaxplayers 24\nPort {port}\nMode normal\n"
+           f"perspective both\nWelcome {DEFAULT_WELCOME}\n//PVE 或 PVP\nPVE\n")
+    if cheat:
+        txt += "cheats on //开启作弊 (check/give/teleport 等管理指令可用)\n"
+    return txt
+
+
+# ---- 仪表盘「默认开服选项」: 应用到当前服务器, 并成为以后新建服务器的默认 ----
+DASH_TOGGLE_IDS = ["keep_inventory", "struct_inv", "veh_inv", "zombie_safe",
+                   "friendly_fire", "airdrops", "max_skills"]
+
+
+def get_server_defaults():
+    d = _settings.get("server_defaults") or {}
+    togs = d.get("toggles")
+    if togs is None:
+        togs = ["keep_inventory"]
+    return {"cheat": bool(d.get("cheat", True)),
+            "toggles": [t for t in togs if t in DASH_TOGGLE_IDS]}
+
+
+def save_server_defaults(d):
+    _settings["server_defaults"] = {"cheat": bool(d.get("cheat")),
+                                    "toggles": [t for t in (d.get("toggles") or [])
+                                                if t in DASH_TOGGLE_IDS]}
+    save_settings()
+
+
+def apply_defaults_to_instance(name):
+    """新建存档时把默认一键开关写入其 Config.txt (作弊在 Commands.dat 生成时已带上)"""
+    cfg_path = os.path.join(game_dir(), "Servers", name, "Config.txt")
+    for t in TOGGLES:
+        if t["id"] in get_server_defaults()["toggles"]:
+            for sec, key, val in t["keys"]:
+                set_cfg(cfg_path, sec, key, val)
 
 
 def _ensure_cfg_file(cfg_path):
@@ -499,7 +726,8 @@ def ensure_instance_files(name):
     base = os.path.join(game_dir(), "Servers", name)
     os.makedirs(os.path.join(base, "Server"), exist_ok=True)
     cmd_path = os.path.join(base, "Server", "Commands.dat")
-    if not os.path.isfile(cmd_path):
+    created_cmd = not os.path.isfile(cmd_path)
+    if created_cmd:
         port = 26010
         try:
             used = set()
@@ -515,8 +743,13 @@ def ensure_instance_files(name):
         except OSError:
             pass
         with open(cmd_path, "w", encoding="utf-8") as f:
-            f.write(default_commands_text(name, port))
+            f.write(default_commands_text(name, port,
+                                          get_server_defaults()["cheat"]))
     _ensure_cfg_file(os.path.join(base, "Config.txt"))
+    if apply_browser_defaults(name, os.path.join(base, "Config.txt")):
+        oplog("操作", f"存档「{name}」写入默认服务器图标与大厅链接 (Config.txt 的 Browser 段)")
+    if created_cmd:
+        apply_defaults_to_instance(name)   # 应用仪表盘「默认开服选项」
     return True
 
 # ================================================================ Commands.dat
@@ -541,10 +774,15 @@ def parse_commands(text):
         if not s.strip() or s.strip().startswith("//"):
             entries.append({"key": None, "value": "", "comment": s.strip()})
             continue
-        m = re.match(r"^\s*([A-Za-z_][\w.]*)\s*(.*?)\s*(//.*)?$", s)
+        cm = re.search(r"\s+//", s)          # 行内注释只在 // 前有空白时才切开
+        comment = ""
+        if cm:
+            comment = s[cm.start():].strip()
+            s = s[:cm.start()].rstrip()
+        m = re.match(r"^([A-Za-z_][\w.]*)\s*(.*)$", s.strip())
         if m:
-            entries.append({"key": m.group(1), "value": m.group(2),
-                            "comment": m.group(3) or ""})
+            entries.append({"key": m.group(1), "value": m.group(2).strip(),
+                            "comment": comment})
         else:
             entries.append({"key": None, "value": "", "comment": ""})
     return entries
@@ -590,27 +828,55 @@ def cmd_info():
 
 
 def set_commands_kv(pairs):
-    """直接改 Commands.dat 的若干键(供进服密码等使用)"""
+    """直接改 Commands.dat 的若干键(供进服密码等使用); value=None 表示整行删除该键"""
     full = commands_path()
     if not os.path.isfile(full):
         return False
     text, _ = read_file(full)
     entries = parse_commands(text)
     for k, v in pairs.items():
-        hit = False
-        for e in entries:
-            if e["key"] and e["key"].lower() == k.lower():
-                e["value"] = v
-                hit = True
-                break
-        if not hit:
+        matched = [e for e in entries if e["key"] and e["key"].lower() == k.lower()]
+        if v is None:
+            entries = [e for e in entries if e not in matched]
+            continue
+        if matched:
+            matched[0]["value"] = v
+        else:
             entries.append({"key": k, "value": v, "comment": ""})
     write_file(full, build_commands(entries))
     return True
 
 
+def cheat_enabled():
+    """Commands.dat 里是否开启作弊 (cheats on; 兼容旧版写法的裸 cheat 行)"""
+    if not setup_done() or not os.path.isfile(commands_path()):
+        return False
+    try:
+        text, _ = read_file(commands_path())
+    except OSError:
+        return False
+    return any(e["key"] and e["key"].lower() in ("cheat", "cheats")
+               for e in parse_commands(text))
+
+
+def set_cheat(on):
+    """给当前存档开启/关闭作弊 (Commands.dat 增删 cheats on 行, 顺带清掉旧版 cheat 行)"""
+    if not os.path.isfile(commands_path()):
+        return False, "找不到 Commands.dat, 请先完成初始设置"
+    try:
+        if on:
+            set_commands_kv({"cheat": None, "cheats": "on"})
+        else:
+            set_commands_kv({"cheat": None, "cheats": None})
+    except OSError as e:
+        return False, str(e)
+    return True, ("已开启作弊选项 (写入 cheats on), 重启服务器后生效" if on
+                  else "已关闭作弊选项, 重启后 check/give/teleport 等管理指令将被禁用")
+
+
 def list_maps():
-    maps = []
+    """探测可用地图: 返回游戏里真实存在的文件夹名 (大小写原样, 游戏按名字找地图)"""
+    maps, seen = [], set()
     g = game_dir()
     bases = []
     if g:
@@ -622,31 +888,48 @@ def list_maps():
     for base in bases:
         if os.path.isdir(base):
             for name in sorted(os.listdir(base)):
-                if os.path.isdir(os.path.join(base, name)) and name.lower() not in maps:
-                    maps.append(name.lower())
+                low = name.lower()
+                if os.path.isdir(os.path.join(base, name)) and low not in seen:
+                    seen.add(low)
+                    maps.append(name)
     return maps
 
 
-def lan_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+def norm_map_name(name):
+    """把用户填的地图名对齐到游戏里真实存在的文件夹名 (大小写照 Maps 里的原样; 名字错了游戏不报错, 只会退回 PEI)"""
+    name = (name or "").strip()
+    if not name:
+        return "", False
+    low = name.lower()
+    for m in list_maps():
+        if m.lower() == low:
+            return m, True
+    return name, False
+
+
+def map_exists(name):
+    """Commands.dat 里写的地图名是否真的存在 (Windows 下大小写不敏感)"""
+    return norm_map_name(name)[1]
 
 
 # ================================================================ 登录密钥 (每次启动随机生成)
 _login_key = [None]
+_login_key_at = [0.0]
+KEY_AUTO_WINDOW = 1800          # 带 ?key= 的网址自动登录有效期 (秒)
 
 
 def login_key():
     """本次运行的网页登录密钥: 每次启动开服器都会重新随机生成, 不再固定"""
     if not _login_key[0]:
         _login_key[0] = "".join(random.choices(string.ascii_letters + string.digits, k=24))
+        _login_key_at[0] = time.time()
     return _login_key[0]
+
+
+def key_auto_ok():
+    """网址里带密钥的自动登录是否还在时间窗口内 (超时须手动输入)"""
+    login_key()
+    return time.time() - _login_key_at[0] < KEY_AUTO_WINDOW
 
 
 # ================================================================ 文件列表
@@ -747,12 +1030,46 @@ _log_tails = {"rocket": {"off": 0, "partial": b""},
 _server_code = [None]
 ERR_RE = re.compile(r"(error|exception|fail|warn)", re.I)
 CODE_RE = re.compile(r"Server Code:\s*([0-9]{6,})", re.I)
+# 关卡加载进度: 游戏先打印 Server Code, 之后才到 100%, 所以代码要等加载完再放出
+LEVEL_RE = re.compile(r"loading\s*level\s*[:：]\s*(\d{1,3})\s*%", re.I)
+CODE_GATE_SEC = 90
+_pending_code = [None]         # 抓到但尚未确认加载完成的代码
+_code_seen_at = [0.0]
+_level_loaded = [False]
+
+
+def _reset_code_gate():
+    """每次开服前调用: 上一局的代码绝不能继续显示"""
+    _server_code[0] = None
+    _pending_code[0] = None
+    _code_seen_at[0] = 0.0
+    _level_loaded[0] = False
+
+
+def _release_code():
+    """地图确实加载到 100% (或距代码行已超时) 才把代码交给仪表盘显示"""
+    if _pending_code[0] is None:
+        return
+    if _level_loaded[0] or (time.time() - _code_seen_at[0] > CODE_GATE_SEC):
+        _server_code[0] = _pending_code[0]
+        _pending_code[0] = None
+
+
+def _feed_code_gate(line):
+    m = CODE_RE.search(line)
+    if m:
+        _pending_code[0] = m.group(1)
+        _code_seen_at[0] = time.time()
+        _level_loaded[0] = False          # 出现新代码 = 新的一局, 重新等加载完成
+        return m
+    lv = LEVEL_RE.search(line)
+    if lv and int(lv.group(1)) >= 100:
+        _level_loaded[0] = True
+    return None
 
 
 def _log(line, src="srv"):
-    m = CODE_RE.search(line)
-    if m:
-        _server_code[0] = m.group(1)
+    m = _feed_code_gate(line)
     if re.search(r"(error|exception|fail)", line, re.I):
         err = 1
     elif re.search(r"warn", line, re.I):
@@ -815,6 +1132,23 @@ def _tail_file(path, state, src):
         pass
 
 
+def _skip_old_log_lines():
+    """新的一局从日志末尾开始读: 不重放上一次开服的历史
+    (Rocket.log 是跨次启动追加的, 从头读会把上一局的 Server Code 当成当前的)"""
+    for st in _log_tails.values():
+        st.update(off=0, partial=b"")
+    sd = server_dir()
+    if not sd:
+        return
+    for key, rel in (("console", "console.log"),
+                     ("rocket", os.path.join("Rocket", "Logs", "Rocket.log"))):
+        try:
+            size = os.path.getsize(os.path.join(sd, rel))
+        except OSError:
+            continue
+        _log_tails[key].update(off=size, partial=b"")
+
+
 def _push_log_tails():
     """网页日志来源: 原版控制台模式下优先 console.log(中继器写入), 否则 Rocket 日志"""
     sd = server_dir()
@@ -826,6 +1160,7 @@ def _push_log_tails():
     else:
         _tail_file(os.path.join(sd, "Rocket", "Logs", "Rocket.log"),
                    _log_tails["rocket"], "rocket")
+    _release_code()
 
 
 _srv_check = {"t": 0.0, "res": (False, None)}
@@ -858,6 +1193,19 @@ def server_running():
     return res
 
 
+def map_warning():
+    """开服前地图体检: 地图名探测不到时游戏不会报错, 而是默默退回默认 PEI"""
+    cur = (cmd_info().get("map") or "").strip()
+    if not cur or map_exists(cur):
+        return ""
+    long_msg = (f"⚠ WARNING: 地图「{cur}」在 U3DS\\Maps 和存档 Level 里都没有找到 —— "
+                f"游戏不会报错, 但会默默退回默认地图 PEI。请核对地图名 (大小写和下划线照原样抄), "
+                f"如果这是创意工坊地图, 要先在「创意工坊」页订阅它, 开服时才会自动下载")
+    _log(long_msg, "sys")
+    oplog("错误", f"地图体检失败: Commands.dat 写的地图是「{cur}」, 但 Maps/Level 里探测不到")
+    return f" (⚠ 地图「{cur}」没找到, 可能会退回默认地图 PEI)"
+
+
 def start_server():
     global _proc
     running, _ = server_running()
@@ -865,6 +1213,7 @@ def start_server():
         return False, "服务器已经在运行了"
     if not setup_done():
         return False, "请先完成开服器初始设置 (游戏目录 / 存档)"
+    warn = map_warning()
     patch_rcon()   # 临时启用 RCON, 用于控制台发命令与安全关服
     # 按「服务器设置」页配置的启动参数组装命令
     lc = get_launch_cfg()
@@ -877,8 +1226,8 @@ def start_server():
     extra = (lc.get("extra") or "").split()
     if extra:
         cmd.extend(extra)
-    for _st in _log_tails.values():
-        _st.update(off=0, partial=b"")
+    _skip_old_log_lines()
+    _reset_code_gate()   # 每次开服的代码都不同, 上一局的绝不能继承
     if lc.get("console", True):
         # 原版方式: 通过控制台中继器启动 —— 弹出独立控制台窗口显示全部输出,
         # 同时写入 console.log 供网页日志使用; 关闭开服器/网页不影响服务器
@@ -899,9 +1248,9 @@ def start_server():
                 stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NO_WINDOW)
             threading.Thread(target=_reader, args=(_proc,), daemon=True).start()
-    _log("—— 服务器启动中, 服务器代码(Server Code)出现后会显示在仪表盘", "sys")
+    _log("—— 服务器启动中, 地图加载到 100% 后本次的服务器代码(Server Code)会显示在仪表盘", "sys")
     oplog("操作", f"启动服务器: {' '.join(cmd)}")
-    return True, "服务器启动中, 大约需要 30~60 秒, 可到「控制台」页看进度"
+    return True, ("服务器启动中, 大约需要 30~60 秒, 可到「控制台」页看进度" + warn)
 
 
 def find_server_pids():
@@ -1158,7 +1507,17 @@ def save_launch_cfg(lc):
 
 
 def rocket_installed():
-    return os.path.isdir(os.path.join(game_dir(), "Modules", "Rocket.Unturned"))
+    g = game_dir()
+    return bool(g) and os.path.isdir(os.path.join(g, "Modules", "Rocket.Unturned"))
+
+
+def rocket_status():
+    """Rocket 前置状态: 是否已安装 / 游戏目录里是否有官方安装脚本"""
+    if not game_dir():
+        return {"installed": False, "bat": False}
+    g = game_dir()
+    return {"installed": rocket_installed(),
+            "bat": os.path.isfile(os.path.join(g, "Extras", "Install Rocket.bat"))}
 
 
 def install_rocket():
@@ -1178,6 +1537,415 @@ def install_rocket():
     if ok:
         return True, "Rocket 安装/更新完成, 重启服务器后生效"
     return False, "安装脚本已执行, 但未检测到 Modules\\Rocket.Unturned, 请截图命令框报错反馈"
+
+
+# ------------------------------------------------- Rocket 指令反馈汉化 (不是汉化控制台日志)
+# 键 = Rocket 翻译文件里的英文 Value 原文 (已反转义), 值 = 中文
+ROCKET_ZH = {
+    # Rocket.en.translation.xml — RCON / 连接提示
+    "{0} connected to the server": "{0} 已连接到服务器",
+    "{0} disconnected from the server": "{0} 已从服务器断开连接",
+    ("#{0}, Connection ID: {1}, Authed: {2}, Address: {3}, Time Connected: {4}, "
+     "Connected For: {5}."): ("#{0}, 连接 ID: {1}, 已验证: {2}, 地址: {3}, 连接时间: {4}, "
+                              "已连接时长: {5}。"),
+    "Usage: rkick <ConnectionID> - Kicks a client off of RCON.":
+        "用法: rkick <连接ID> - 把某个客户端从 RCON 踢下线。",
+    "Error: RCON Client with Connection ID: {0} not found!":
+        "错误: 找不到连接 ID 为 {0} 的 RCON 客户端!",
+    "RCON Client kicked with Connection ID: {0}, Address: {1}!":
+        "已踢出连接 ID 为 {0}、地址为 {1} 的 RCON 客户端!",
+    "Usage: rflush <y> - kicks all connected RCON clients on the server.":
+        "用法: rflush <y> - 踢掉服务器上所有已连接的 RCON 客户端。",
+    "Closing {0} RCON connections.": "正在关闭 {0} 个 RCON 连接。",
+    "#{0}, ConnectionID: {1}, Address: {2}, closed!": "#{0}, 连接 ID: {1}, 地址: {2}, 已关闭!",
+    "You do not have permissions to execute this command.": "你没有权限执行这条指令。",
+    "You have to wait {0} seconds before you can use this command again.":
+        "你需要等待 {0} 秒才能再次使用这条指令。",
+
+    # Rocket.Unturned.en.translation.xml — 游戏内指令反馈
+    "Failed to find player": "没有找到玩家",
+    "Invalid parameter": "参数不正确",
+    "Target player not found": "没有找到目标玩家",
+    "You cannot teleport while driving or riding in a vehicle.": "驾驶或乘坐载具时无法传送。",
+    "{0} enabled Godmode": "{0} 已开启无敌模式",
+    "You can feel the strength now...": "力量涌上来了……",
+    "{0} disabled Godmode": "{0} 已关闭无敌模式",
+    "The godly powers left you...": "神力离你而去……",
+    "{0} enabled Vanishmode": "{0} 已开启隐身模式",
+    "You are vanished now...": "你现在隐身了……",
+    "{0} disabled Vanishmode": "{0} 已关闭隐身模式",
+    "You are no longer vanished...": "你不再隐身了……",
+    "{0} is in duty": "{0} 已进入值班模式",
+    "You are in duty now...": "你现在处于值班模式……",
+    "{0} is no longer in duty": "{0} 已退出值班模式",
+    "You are no longer in duty...": "你已退出值班模式……",
+    "You do not have a bed to teleport to.": "你没有可以传送过去的床。",
+    "Your bed is obstructed.": "你的床被挡住了。",
+    "You have tried to spawn too many items! The limit is {0}.": "你想生成的物品太多了!上限是 {0}。",
+    "This item is restricted!": "这个物品被限制了!",
+    "Giving {0} item {1}:{2}": "正在给 {0} 物品 {1}:{2}",
+    "Giving you item {0}x {1} ({2})": "正在给你物品 {0}x {1} ({2})",
+    "Spawning {1} zombies near {0}": "正在 {0} 附近生成 {1} 个僵尸",
+    "Spawning {0} zombies nearby": "正在附近生成 {0} 个僵尸",
+    "Failed giving you item {0}x {1} ({2})": "给你物品 {0}x {1} ({2}) 失败",
+    "Giving {0} vehicle {1}": "正在给 {0} 载具 {1}",
+    "This vehicle is restricted!": "这个载具被限制了!",
+    "Giving you a {0} ({1})": "正在给你一辆 {0} ({1})",
+    "Failed giving you a {0} ({1})": "给你 {0} ({1}) 失败",
+    "TPS: {0}": "服务器 TPS: {0}",
+    "Running since: {0} UTC": "开服至今: {0} UTC",
+    "Reloaded permissions": "权限表已重新载入",
+    "{0} groups are: {1}": "{0} 所在的用户组: {1}",
+    "{0} permissions are: {1}": "{0} 的权限: {1}",
+    "{0} teleported to {1}": "{0} 已传送到 {1}",
+    "Teleported to {0}": "已传送到 {0}",
+    "Failed to find destination": "没有找到传送目标",
+    "The player you are trying to teleport is in a vehicle": "你要传送的玩家正在载具里",
+    "{0} was teleported to {1}": "已把 {0} 传送到 {1}",
+    "Teleported {0} to you": "已把 {0} 传送到你位置",
+    "You were teleported to {0}": "你已被传送到 {0}",
+    "There was an error clearing {0} inventory.": "清空 {0} 的物品栏时出错。",
+    "Your inventory was cleared!": "你的物品栏已被清空!",
+    "Your inventory was cleared by {0}!": "你的物品栏被 {0} 清空了!",
+    "You successfully cleared {0} inventory.": "你成功清空了 {0} 的物品栏。",
+    "{0} SteamID64 is {1}": "{0} 的 SteamID64 是 {1}",
+    "{0} was successfully healed": "已成功治疗 {0}",
+    "You were healed by {0}": "你被 {0} 治疗了",
+    "You were healed": "你已被治疗",
+    "You are facing {0}": "你当前朝向: {0}",
+    "N": "北", "E": "东", "S": "南", "W": "西",
+    "NW": "西北", "NE": "东北", "SW": "西南", "SE": "东南",
+    "Loaded: {0}": "已加载: {0}",
+    "Unloaded: {0}": "已卸载: {0}",
+    "Failure: {0}": "失败: {0}",
+    "Cancelled: {0}": "已取消: {0}",
+    "Reloading {0}": "正在重载 {0}",
+    "The plugin {0} is not loaded": "插件 {0} 没有在运行",
+    "Unloading {0}": "正在卸载 {0}",
+    "Loading {0}": "正在加载 {0}",
+    "The plugin {0} is already loaded": "插件 {0} 已经加载过了",
+    "Reloading Rocket": "正在重载 Rocket 前置",
+    "Please reload individual plugins instead": "请改为逐个重载插件",
+    "Group not found": "没有找到用户组",
+    "{0} was added to the group {1}": "已把 {0} 加入用户组 {1}",
+    "{0} was removed from from the group {1}": "已把 {0} 从用户组 {1} 移除",
+    "Unknown error": "未知错误",
+    "{0} was not found": "没有找到 {0}",
+    "{1} was not found": "没有找到 {1}",
+    "{0} is already in the group {1}": "{0} 已经在用户组 {1} 里了",
+    "Permissions reloaded": "权限设置已重新载入",
+    "Plugin {0} not found": "没有找到插件 {0}",
+    "You successfully cleared {0} items": "你成功清理了 {0} 个物品",
+    "Usage: /more <amount>": "用法: /more <数量>",
+    "No item being held in hands.": "手上没有拿物品。",
+    "Giving {0} of item: {1}.": "已把 {1} 的数量改为 {0}。",
+    "invalid character name": "角色名称不合法",
+    "Command not found.": "没有找到这条指令。",
+}
+_ROCKET_ZH_BACK = {v: k for k, v in ROCKET_ZH.items()}
+ROCKET_ZH_FILES = ("Rocket.en.translation.xml", "Rocket.Unturned.en.translation.xml")
+_XML_UNESC = (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&apos;", "'"), ("&#39;", "'"))
+_VALUE_RE = re.compile(r'Value="([^"]*)"')
+
+
+def xml_unescape(s):
+    for e, c in _XML_UNESC:
+        s = s.replace(e, c)
+    return s.replace("&amp;", "&")
+
+
+def xml_escape(s):
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def rocket_trans_paths():
+    sd = server_dir()
+    return [os.path.join(sd, "Rocket", f) for f in ROCKET_ZH_FILES] if sd else []
+
+
+def _translate_xml(text, mapping):
+    """按英文 Value 原文整段替换 (同一 Id 可能对应多条 Value, 所以不能用 Id 匹配)"""
+    hit = 0
+
+    def rep(m):
+        nonlocal hit
+        key = xml_unescape(m.group(1))
+        if key not in mapping:
+            return m.group(0)
+        hit += 1
+        return 'Value="' + xml_escape(mapping[key]) + '"'
+
+    return _VALUE_RE.sub(rep, text), hit
+
+
+def rocket_zh_status():
+    """指令反馈汉化状态: missing=还没生成翻译文件, on=已是中文"""
+    paths = [p for p in rocket_trans_paths() if os.path.isfile(p)]
+    if not paths:
+        return {"files": 0, "on": False, "missing": True}
+    en = zh = 0
+    for p in paths:
+        try:
+            text = read_file(p)[0]
+        except OSError:
+            continue
+        for v in _VALUE_RE.findall(text):
+            v = xml_unescape(v)
+            en += v in ROCKET_ZH
+            zh += v in _ROCKET_ZH_BACK
+    return {"files": len(paths), "on": zh > 0 and en == 0, "missing": False}
+
+
+def set_rocket_zh(on):
+    """开/关 Rocket 指令反馈汉化: 改写存档 Rocket 目录里的两个 .en.translation.xml"""
+    st = rocket_zh_status()
+    if st["missing"]:
+        return False, ("存档的 Rocket 文件夹里还没有 .en.translation.xml — "
+                       "请先安装 Rocket 前置插件并开一次服, 让 Rocket 自动生成这两个文件")
+    mapping = ROCKET_ZH if on else _ROCKET_ZH_BACK
+    total, files = 0, 0
+    for p in rocket_trans_paths():
+        if not os.path.isfile(p):
+            continue
+        try:
+            old, enc = read_file(p)
+            new, n = _translate_xml(old, mapping)
+            if n:
+                # 原样写回 (不追加换行/不转换换行符), 保证恢复英文时逐字节还原
+                with open(p, "w", encoding=enc, newline="") as f:
+                    f.write(new)
+                files += 1
+                total += n
+        except OSError as e:
+            oplog("错误", f"Rocket 指令汉化写入失败 {os.path.basename(p)}: {e}")
+            return False, f"写入失败: {e}"
+    if not total:
+        return True, ("已经处于" + ("汉化" if on else "英文") + "状态了, 无需改动")
+    oplog("操作", f"Rocket 指令反馈汉化 → {'开启' if on else '恢复英文'} ({files} 个文件 {total} 条文案)")
+    return True, (f"已{'汉化' if on else '恢复英文'} {total} 条指令反馈 ({files} 个文件), 重启服务器后生效")
+
+
+# ================================================================ 存档备份 / 删除
+LEVEL_FILE_ZH = {
+    "structures": "建筑主体 — 玩家搭建的房子、楼梯、地板等结构数据",
+    "barricades": "障碍物 — 地基、墙、门、栅栏、路障、陷阱等摆放物",
+    "objects": "场景物件 — 地图上被移动/破坏过的箱子、物品与物件",
+    "vehicles": "载具 — 停放在地图上的车、船、飞机等",
+    "groups": "建筑分组 — 把多个结构归成同一栋房的记录",
+    "lighting": "光照数据 — 该地图的灯光/夜景缓存",
+}
+PLAYER_FILE_ZH = {
+    "player": "玩家主档 — 角色、职业与出生点等基础信息",
+    "inventory": "物品栏 — 背包、随身与存储的全部物品",
+    "skills": "技能 — 各项技能等级与经验",
+    "life": "生存状态 — 血量、饥饿、口渴、疾病等",
+    "quests": "任务进度 — 各任务/成就的完成情况",
+    "clothing": "外观穿着 — 当前穿戴的衣服装备外观",
+    "anim": "动作数据 — 动画与姿态状态",
+}
+
+
+def save_file_desc(rel):
+    """给加密的存档文件一句中文说明 (文件本身打不开, 只能按名字说明)"""
+    name = os.path.basename(rel)
+    stem = os.path.splitext(name)[0].lower()
+    old = name.endswith("~")
+    parts = rel.replace("\\", "/").split("/")
+    d = (LEVEL_FILE_ZH if parts[0].lower() == "level" else PLAYER_FILE_ZH).get(stem)
+    if not d:
+        d = "存档数据文件 (未识别的名称, 属于该存档的地图/玩家数据)"
+    return ("♻ 上一次保存的旧版本 · " + d) if old else d
+
+
+def save_file_full(rel, must_exist=True):
+    """把相对路径解析成绝对路径; 只允许 Level / Players 两个子树内的文件"""
+    sd = server_dir()
+    if not sd:
+        return None
+    top = str(rel).replace("\\", "/").strip("/")
+    parts = [p for p in top.split("/") if p not in ("", ".", "..")]
+    if len(parts) < 2 or parts[0].lower() not in ("level", "players"):
+        return None
+    base = os.path.abspath(sd)
+    full = os.path.abspath(os.path.join(base, *parts))
+    if not full.startswith(base + os.sep):
+        return None
+    if os.path.isdir(full):
+        return None                              # 目录一律拒绝: 只处理文件
+    if must_exist and not os.path.isfile(full):
+        return None
+    if os.path.splitext(full)[1].lower() not in (".dat", ".dat~"):
+        return None                              # 白名单: 只认存档数据文件
+    return full
+
+
+def _file_row(full, rel):
+    try:
+        st = os.stat(full)
+    except OSError:
+        return None
+    return {"rel": rel.replace("\\", "/"), "size": st.st_size,
+            "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
+            "desc": save_file_desc(rel), "old": rel.endswith("~")}
+
+
+def save_inventory():
+    """列出建筑存档(Level/<地图>) 与玩家存档(Players/<SteamID>_0) 的可备份文件"""
+    sd = server_dir()
+    out = {"level": [], "players": []}
+    if not sd:
+        return out
+    lv = os.path.join(sd, "Level")
+    if os.path.isdir(lv):
+        for m in sorted(os.listdir(lv)):
+            d = os.path.join(lv, m)
+            if not os.path.isdir(d):
+                continue
+            rows = []
+            for name in sorted(os.listdir(d)):
+                p = os.path.join(d, name)
+                if os.path.isfile(p):
+                    r = _file_row(p, f"Level/{m}/{name}")
+                    if r:
+                        rows.append(r)
+            out["level"].append({"map": m, "files": rows,
+                                 "size": sum(r["size"] for r in rows)})
+    pl = os.path.join(sd, "Players")
+    if os.path.isdir(pl):
+        for pid in sorted(os.listdir(pl)):
+            d = os.path.join(pl, pid)
+            if not os.path.isdir(d):
+                continue
+            rows = []
+            for cur, _dirs, names in os.walk(d):
+                for name in sorted(names):
+                    p = os.path.join(cur, name)
+                    rel = os.path.relpath(p, sd)
+                    if not save_file_full(rel):
+                        continue
+                    r = _file_row(p, rel)
+                    if r:
+                        rows.append(r)
+            rows.sort(key=lambda r: r["rel"])
+            maps = sorted({r["rel"].split("/")[2] for r in rows if len(r["rel"].split("/")) > 3})
+            out["players"].append({"id": pid, "files": rows, "maps": maps,
+                                   "size": sum(r["size"] for r in rows)})
+    return out
+
+
+def backup_saves(items, dest):
+    """把选中的存档文件按原目录结构复制到用户指定位置; 返回 (ok, msg, 备份目录)"""
+    inst = instance() or "save"
+    files = []
+    for rel in items:
+        full = save_file_full(rel)
+        if not full:
+            return False, f"路径不被允许 (只能备份 Level/Players 里的存档文件): {rel}", None
+        files.append((rel.replace("\\", "/"), full))
+    if not files:
+        return False, "没有勾选任何存档文件", None
+    dest = str(dest or "").strip().strip('"')
+    if not dest:
+        return False, "请先选择备份保存的位置", None
+    stamp = time.strftime("%Y-%m-%d_%H%M%S")
+    target = os.path.normpath(os.path.join(dest, f"{inst}_备份_{stamp}"))
+    try:
+        os.makedirs(dest, exist_ok=True)
+        test = os.path.join(dest, ".ds_storagetest")
+        with open(test, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(test)
+    except OSError as e:
+        return False, f"目标位置无法写入: {e} — 请换一个文件夹", None
+    done, skipped, total_bytes = 0, [], 0
+    for rel, full in files:
+        dst = os.path.join(target, *rel.split("/"))
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(full, dst)
+            if not (os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(full)):
+                skipped.append(rel)
+                continue
+            done += 1
+            total_bytes += os.path.getsize(full)
+        except OSError as e:
+            skipped.append(f"{rel} ({e})")
+    if not done:
+        return False, "备份失败, 一个文件都没有复制成功 — 已中止, 不会删除任何东西", None
+    msg = (f"已备份 {done} 个文件 ({human_size(total_bytes)}) → {target}"
+           + (f"; 失败 {len(skipped)} 个: {', '.join(skipped[:3])}" if skipped else ""))
+    oplog("操作", f"备份存档 {done} 个文件 → {target}")
+    return True, msg, target
+
+
+def delete_saves(items, dest):
+    """删除存档文件: 强制先备份成功, 且只删对应文件, 绝不删目录"""
+    running, _ = server_running()
+    if running:
+        return False, "服务器正在运行 — 请先关服再删除存档, 否则服务器会把数据重新写回去", None
+    fulls = []
+    for rel in items:
+        full = save_file_full(rel)
+        if not full:
+            return False, f"路径不被允许, 已中止 (不会删除任何东西): {rel}", None
+        fulls.append((rel.replace("\\", "/"), full))
+    if not fulls:
+        return False, "没有勾选要删除的存档文件", None
+    ok, msg, target = backup_saves([r for r, _ in fulls], dest)
+    if not ok:
+        return False, f"备份没有完成, 已取消删除: {msg}", None
+    removed, failed = 0, []
+    for rel, full in fulls:
+        try:
+            os.remove(full)
+            removed += 1
+        except OSError as e:
+            failed.append(f"{rel} ({e})")
+    oplog("操作", f"删除存档文件 {removed} 个 (备份在 {target})")
+    m = (f"已备份并删除 {removed} 个存档文件; 空文件夹已保留, 备份在 {target}")
+    if failed:
+        m += f"; {len(failed)} 个删除失败: {', '.join(failed[:3])}"
+    return True, m, target
+
+
+def list_dirs(path):
+    """浏览本机目录, 只返回目录名 (供选择备份位置)"""
+    p = str(path or "").strip().strip('"')
+    if not p:
+        roots = [{"name": f"{d}:\\", "path": f"{d}:\\"} for d in "CDEFGHIJKLMNOPQRSTUVWXYZ"
+                 if os.path.isdir(f"{d}:\\")]
+        return {"ok": True, "cwd": "", "parent": "", "dirs": roots,
+                "drives": True}
+    full = os.path.abspath(p)
+    parent = os.path.dirname(full)
+    if parent == full:                              # 已在盘符根: 上一级回到盘符列表
+        parent = ""
+    out = []
+    try:
+        for name in sorted(os.listdir(full), key=str.lower):
+            sub = os.path.join(full, name)
+            try:
+                if not os.path.isdir(sub):
+                    continue
+                if os.stat(sub).st_file_attributes & 2:      # 隐藏目录不显示
+                    continue
+            except OSError:
+                continue
+            out.append({"name": name, "path": sub})
+            if len(out) >= 400:
+                break
+    except OSError as e:
+        return {"ok": False, "msg": f"打不开该文件夹: {e}"}
+    return {"ok": True, "cwd": full, "parent": parent, "dirs": out}
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n} B"
 
 
 def _write_title_file(n):
@@ -1210,13 +1978,42 @@ def _title_updater(tfile):
             pass
 
 
+# Rocket / 原版 players 输出的一行:
+#   PlayerID: 76561198840375182 Name: Pippl Character: #小明 Ping: 86
+PLAYER_ROW_RE = re.compile(
+    r"playerid\s*[:：]\s*(\d{6,})\s+name\s*[:：]\s*(.*?)"
+    r"(?:\s*character\s*[:：]\s*(.*?))?(?:\s+ping\s*[:：]\s*[\d.]+)?\s*$", re.I)
+STEAMID_RE = re.compile(r"\b(765\d{14,16})\b")
+# 这些词是表格表头/字段名, 绝不能被当成玩家名字
+NOT_A_NAME = {"players", "player", "playerid", "steamid", "steam", "name",
+              "character", "ping", "online", "offline", "id", "id:", "列表"}
+
+
 def parse_players(resp):
     """解析 players 命令输出 -> [{name, steamid}]; 兼容各种输出格式"""
-    players, seen = [], set()
+    players, seen, names = [], set(), set()
     if not resp:
         return players
     if re.search(r"fail(?:ed)?\s+to find|no (?:players|one)|nobody|0 players", resp, re.I):
         return players
+
+    def add(name, sid):
+        name = re.sub(r"^\d+\s*[.)]\s*", "", (name or "")).strip(" ,.-–—:.\t|()[]{}")
+        sid = (sid or "").strip()
+        if sid:
+            if sid in seen:
+                return
+            seen.add(sid)
+        elif name in names:
+            return
+        if (not name or len(name) > 40 or name.lower() in NOT_A_NAME
+                or re.match(r"^(ping|character|name|playerid|steamid)\s*[:：]", name, re.I)):
+            name = sid
+        if not name:
+            return
+        names.add(name)
+        players.append({"name": name, "steamid": sid})
+
     for raw in resp.splitlines():
         line = re.sub(r"^(\[[^\]]*\]\s*)+", "", raw.strip())   # 去 [Info] 等日志前缀
         if not line:
@@ -1224,41 +2021,39 @@ def parse_players(resp):
         # 跳过指令回显和明显不是玩家行的内容
         if re.search(r"executed command|has executed|mscorlib\s*>>", line, re.I):
             continue
+        # 表头行 "Players:" / "Player list" —— 只认 "PlayerID: …" 那种数据行
+        if re.match(r"^players?\s*[:：]?\s*$", line, re.I):
+            continue
         # "Players: 名字1, 名字2" 逗号列表格式
-        if re.match(r"^players?$", line, re.I):
-            continue                                   # 裸 "players" 指令头行
         m0 = re.match(r"^players?\s*[:：]\s*(.+)$", line, re.I)
         if m0:
             listing = m0.group(1)
-            if "," in listing or "、" in listing:
+            if "," in listing or "、" in listing or "，" in listing:
                 for n in re.split(r"[,，、]", listing):
-                    n = n.strip(" -–—:.\t|")
-                    if n and len(n) <= 40 and n not in [p["name"] for p in players]:
-                        players.append({"name": n, "steamid": ""})
+                    ms = STEAMID_RE.search(n)
+                    add(re.sub(STEAMID_RE, "", n), ms.group(1) if ms else "")
+            else:
+                ms = STEAMID_RE.search(listing)
+                add(re.sub(STEAMID_RE, "", listing), ms.group(1) if ms else "")
             continue
         if re.match(r"^(successfully|saved|loading|updates|ticks)", line, re.I):
             continue
-        m = re.search(r"(.{0,40}?)\s*[\(\[]\s*(7654\d{13,15})\s*[\)\]]", line)
+        m = PLAYER_ROW_RE.search(line)
         if m:
-            name, sid = m.group(1), m.group(2)
-        else:
-            m = re.search(r"(7654\d{13,15})", line)
-            if m:
-                sid = m.group(1)
-                before = line[:m.start()].strip(" -–—:.\t|")
-                after = line[m.end():].strip(" -–—:.\t|")
-                name = before or after
-            else:
-                sid = ""
-                name = re.sub(r"^\d+\s*[.)]\s*", "", line).strip(" .-–—:.\t|")
-                if not name or len(name) > 40:
-                    continue
-        name = re.sub(r"^\d+\s*[.)]\s*", "", name).strip(" .-–—:.\t")
-        if sid and sid in seen:
+            add(m.group(2) or m.group(3), m.group(1))
             continue
-        if sid:
-            seen.add(sid)
-        players.append({"name": name or sid, "steamid": sid})
+        ms = STEAMID_RE.search(line)
+        if ms:
+            sid = ms.group(1)
+            before = line[:ms.start()].strip(" -–—:.\t|")
+            after = line[ms.end():].strip(" -–—:.\t|")
+            cand = before or re.sub(r"^name\s*[:：]?\s*", "", after, flags=re.I)
+            add(cand, sid)
+            continue
+        # 只剩纯文字行: 必须像人名才收 (避免把日志句子当成玩家)
+        if len(line) > 40 or re.search(r"\d", line):
+            continue
+        add(line, "")
     return players
 
 
@@ -1291,7 +2086,7 @@ html.light .side{background:rgba(255,255,255,.58);border-right:1px solid rgba(25
 .logo .ic{width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);
 display:flex;align-items:center;justify-content:center;font-size:20px}
 .logo b{font-size:16px}.logo .sub{font-size:11px;color:var(--sub)}
-.nav{padding:8px 12px;flex:1}
+.nav{padding:8px 12px;flex:1;overflow:auto}
 .nav a{display:flex;gap:11px;align-items:center;padding:10px 13px;border-radius:10px;color:var(--sub);
 text-decoration:none;font-size:14px;margin-bottom:2px;transition:.15s}
 .nav a:hover{background:rgba(255,255,255,.05);color:var(--txt)}
@@ -1341,74 +2136,40 @@ html.light .tog .tr{background:rgba(0,0,0,.15);box-shadow:inset 0 1px 3px rgba(0
 top:3px;left:3px;transition:.2s;box-shadow:0 2px 6px rgba(0,0,0,.3)}
 .tog input:checked+.tr{background:linear-gradient(135deg,#22c55e,#15803d)}
 .tog input:checked+.tr:before{transform:translateX(20px);background:#fff}
-/* 火把勾选框 (Uiverse.io by kelvyn_8843) — 勾选=点燃发光 */
+/* 玻璃质感勾选框 (Uiverse.io 模板) — 勾选=蓝色高亮打勾 */
 .container{display:inline-flex;align-items:center;gap:10px;position:relative;cursor:pointer;
-user-select:none;color:var(--sub);font-size:13px;vertical-align:middle}
+user-select:none;-webkit-tap-highlight-color:transparent;color:var(--sub);font-size:13px;
+vertical-align:middle;--ck:22px}
+.container.ck-lg{--ck:26px}
 .container:hover{color:var(--txt)}
 .container input{position:absolute;opacity:0;cursor:pointer;height:0;width:0}
-.container .torch{display:flex;justify-content:center;height:150px;zoom:.38;margin:-28px -10px;flex:none}
-.container.torch-lg .torch{zoom:.5;margin:-12px -14px}
-.container .head,.container .stick{position:absolute;width:30px;transform-style:preserve-3d;
-transform:rotateX(-30deg) rotateY(45deg);backface-visibility:hidden}
-.container .stick{position:relative;height:120px}
-.container .face{position:absolute;transform-style:preserve-3d;width:30px;height:30px;
-display:grid;grid-template-columns:50% 50%;grid-template-rows:50% 50%;gap:0;
-background-color:#1a140d;transition:filter .3s ease;backface-visibility:hidden}
-.container .top{transform:rotateX(90deg) translateZ(15px)}
-.container .left{transform:rotateY(-90deg) translateZ(15px)}
-.container .right{transform:rotateY(0deg) translateZ(15px)}
-.container .top div,.left div,.right div,.side-left div,.side-right div{width:100%;height:100%}
-.top div:nth-child(1),.left div:nth-child(3),.right div:nth-child(3){background-color:#2c2c25}
-.top div:nth-child(2),.left div:nth-child(1),.right div:nth-child(1){background-color:#221f11}
-.top div:nth-child(3),.left div:nth-child(4),.right div:nth-child(4){background-color:#21211c}
-.top div:nth-child(4),.left div:nth-child(2),.right div:nth-child(2){background-color:#1a140d}
-.container .side{position:absolute;width:30px;height:120px;display:grid;grid-template-columns:50% 50%;
-grid-template-rows:repeat(8,12.5%);gap:0;cursor:pointer;translate:0 12px;backface-visibility:hidden}
-.container .side-left{transform:rotateY(-90deg) translateZ(15px) translateY(8px)}
-.container .side-right{transform:rotateY(0deg) translateZ(15px) translateY(8px)}
-.container .side div:nth-child(1){background-color:#443622}
-.container .side div:nth-child(2){background-color:#2e2517}
-.container .side div:nth-child(3),.side div:nth-child(5){background-color:#4b3b23}
-.container .side div:nth-child(4),.side div:nth-child(10){background-color:#251e12}
-.container .side div:nth-child(6){background-color:#292115}
-.container .side div:nth-child(7){background-color:#4b3c26}
-.container .side div:nth-child(8){background-color:#292115}
-.container .side div:nth-child(9){background-color:#4b3a21}
-.container .side div:nth-child(11),.side div:nth-child(15){background-color:#3d311d}
-.container .side div:nth-child(12){background-color:#2c2315}
-.container .side div:nth-child(13){background-color:#493a22}
-.container .side div:nth-child(14){background-color:#2b2114}
-.container .side div:nth-child(16){background-color:#271e10}
-.container input:checked~.torch .face{filter:drop-shadow(0 0 2px rgb(255,255,255))
- drop-shadow(0 0 10px rgba(255,237,156,.7)) drop-shadow(0 0 25px rgba(255,227,101,.4))}
-.container input:checked~.torch .top div:nth-child(1),
-.container input:checked~.torch .left div:nth-child(3),
-.container input:checked~.torch .right div:nth-child(3){background-color:#ffff97}
-.container input:checked~.torch .top div:nth-child(2),
-.container input:checked~.torch .left div:nth-child(1),
-.container input:checked~.torch .right div:nth-child(1){background-color:#ffd800}
-.container input:checked~.torch .top div:nth-child(3),
-.container input:checked~.torch .left div:nth-child(4),
-.container input:checked~.torch .right div:nth-child(4){background-color:#fff}
-.container input:checked~.torch .top div:nth-child(4),
-.container input:checked~.torch .left div:nth-child(2),
-.container input:checked~.torch .right div:nth-child(2){background-color:#ff8f00}
-.container input:checked~.torch .side div:nth-child(1){background-color:#7c623e}
-.container input:checked~.torch .side div:nth-child(2){background-color:#4c3d26}
-.container input:checked~.torch .side div:nth-child(3),
-.container input:checked~.torch .side div:nth-child(5){background-color:#937344}
-.container input:checked~.torch .side div:nth-child(4),
-.container input:checked~.torch .side div:nth-child(10){background-color:#3c2f1c}
-.container input:checked~.torch .side div:nth-child(6){background-color:#423522}
-.container input:checked~.torch .side div:nth-child(7){background-color:#9f7f50}
-.container input:checked~.torch .side div:nth-child(8){background-color:#403320}
-.container input:checked~.torch .side div:nth-child(9){background-color:#977748}
-.container input:checked~.torch .side div:nth-child(11),
-.container input:checked~.torch .side div:nth-child(15){background-color:#675231}
-.container input:checked~.torch .side div:nth-child(12){background-color:#3d301d}
-.container input:checked~.torch .side div:nth-child(13){background-color:#987849}
-.container input:checked~.torch .side div:nth-child(14){background-color:#3b2e1b}
-.container input:checked~.torch .side div:nth-child(16){background-color:#372a17}
+.container .checkmark{position:relative;display:inline-block;flex:none;height:var(--ck);width:var(--ck);
+border-radius:38%;background:rgba(255,255,255,.12);backdrop-filter:blur(16px) saturate(180%);
+-webkit-backdrop-filter:blur(16px) saturate(180%);border:1px solid rgba(255,255,255,.25);
+box-shadow:0 8px 20px rgba(0,0,0,.12),0 2px 6px rgba(0,0,0,.08),
+inset 0 1px 2px rgba(255,255,255,.5),inset 0 -1px 2px rgba(0,0,0,.1);
+transition:all .4s cubic-bezier(.16,1,.3,1)}
+.container:hover input:not(:checked)~.checkmark{background:rgba(255,255,255,.2);
+border-color:rgba(255,255,255,.4);transform:translateY(-1px);
+box-shadow:0 12px 24px rgba(0,0,0,.15),0 4px 8px rgba(0,0,0,.08),inset 0 1.5px 3px rgba(255,255,255,.7)}
+.container input:checked~.checkmark{transform:scale(1.22);
+background:linear-gradient(145deg,#004cff 0%,#0e34b3 50%,hsl(217,100%,25%) 100%);
+border-color:rgba(255,255,255,.45);
+box-shadow:0 12px 28px rgba(0,81,255,.45),0 4px 10px rgba(0,76,255,0),
+inset 0 2px 4px rgba(255,255,255,.6),inset 0 -2px 6px rgba(255,255,255,.35)}
+.container .checkmark:after{content:"";position:absolute;left:33%;top:18.75%;
+width:20%;height:40%;border:solid #fff;border-width:0 calc(var(--ck)*.13) calc(var(--ck)*.13) 0;
+border-radius:2px;transform:rotate(45deg) scale(.3);opacity:0;
+filter:drop-shadow(0 1px 2px rgba(0,0,0,.3));transition:all .35s cubic-bezier(.34,1.56,.64,1)}
+.container input:checked~.checkmark:after{opacity:1;transform:rotate(45deg) scale(1)}
+.container:active input~.checkmark{transform:scale(.92);transition:transform .15s ease-out}
+.container input:focus-visible~.checkmark{outline:2px solid var(--acc2);outline-offset:3px}
+html.light .container input:not(:checked)~.checkmark{background:rgba(0,0,0,.05);
+border-color:rgba(0,0,0,.14);
+box-shadow:0 6px 16px rgba(31,45,61,.12),0 1px 3px rgba(31,45,61,.1),
+inset 0 1px 2px rgba(255,255,255,.9),inset 0 -1px 2px rgba(0,0,0,.05)}
+html.light .container:hover input:not(:checked)~.checkmark{background:rgba(0,0,0,.09);
+border-color:rgba(0,0,0,.22)}
 .container .lbl{white-space:nowrap}
 /* 渐变旋转光晕按钮 (复制服务器代码) */
 .button{display:inline-flex;align-items:center;justify-content:center;padding:28px 56px;border:0;
@@ -1451,10 +2212,17 @@ html.light select.f option{background:#fff;color:#161b20}
 .pills span{display:inline-block;padding:7px 18px;border-radius:99px;border:1px solid var(--line);
 color:var(--sub);font-size:14px;transition:.15s;background:var(--bg)}
 .pills input:checked+span{background:var(--codebg);border-color:var(--acc);color:var(--acc)}
-.addr{text-align:center;padding:30px 20px 28px}
+.addr{text-align:center;padding:30px 20px 28px;position:relative}
 .addr .lb{color:var(--sub);font-size:14px;letter-spacing:2px}
 .addr .big{font:700 42px/1.3 Consolas,monospace;color:var(--bigtxt);margin:10px 0 6px;
 text-shadow:0 0 30px var(--bigglow);word-break:break-all}
+.addr .big.idle{font-family:inherit;font-size:17px;font-weight:600;line-height:1.9;
+letter-spacing:0;color:var(--sub);text-shadow:none;max-width:560px;margin:14px auto 6px}
+.addr .rfbtn{position:absolute;top:16px;right:16px;z-index:2;
+display:inline-flex;align-items:center;gap:5px}
+.addr .rfbtn .ric{display:inline-block;font-size:14px;line-height:1;transition:transform .3s}
+.addr .rfbtn.spin .ric{animation:rfspin .7s linear infinite}
+@keyframes rfspin{to{transform:rotate(360deg)}}
 .addr .tip{color:var(--sub);font-size:13px}
 .stat{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:13px;
 padding:13px 16px;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
@@ -1462,6 +2230,22 @@ html.light .stat{background:rgba(255,255,255,.5);border-color:rgba(255,255,255,.
 .stat .k{color:var(--sub);font-size:12px}.stat .v{font-size:17px;font-weight:bold;margin-top:3px}
 .banner{border-radius:12px;padding:12px 16px;font-size:14px;margin-bottom:16px;border:1px solid}
 .banner.warn{background:rgba(234,179,8,.09);border-color:var(--warn);color:var(--warn)}
+/* 帮助页置顶: 进不去服务器对照表 */
+.card.sos{border-left:5px solid var(--bad);background:
+linear-gradient(135deg,rgba(239,68,68,.10),rgba(255,255,255,.03) 45%)}
+html.light .card.sos{background:linear-gradient(135deg,rgba(194,38,38,.08),rgba(255,255,255,.6) 45%)}
+.card.sos h2{color:var(--bad)}
+.sostag{font-size:11px;font-weight:bold;letter-spacing:1px;color:#fff;background:var(--bad);
+border-radius:999px;padding:3px 10px;flex:none;animation:sospulse 2.2s ease-in-out infinite}
+@keyframes sospulse{50%{opacity:.55}}
+.sosrow{border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:12px;
+padding:11px 14px;margin-top:10px;background:rgba(255,255,255,.035)}
+html.light .sosrow{background:rgba(255,255,255,.62)}
+.sosrow>b{font-size:14px;color:var(--txt)}
+.sosrow .fix{color:var(--sub);font-size:13px;line-height:1.95;margin-top:4px}
+.sosrow .fix b{color:var(--txt)}
+.sosqq{margin-top:12px;border:1px dashed var(--acc);border-radius:12px;padding:11px 14px;
+font-size:13px;color:var(--sub);line-height:1.9}
 .term{background:#0b1120;border:1px solid var(--line);border-radius:12px;padding:12px 14px;
 height:480px;overflow-y:auto;font:13px/1.5 Consolas,monospace}
 .term .l{white-space:pre-wrap;word-break:break-all;color:#cbd5e1}
@@ -1545,6 +2329,153 @@ box-shadow:0 0 16px rgba(59,130,246,.55),inset 0 1px 2px rgba(255,255,255,.35)}
 /* 头像 */
 .logo-img{border-radius:14px;object-fit:cover;flex:none;
 box-shadow:0 0 0 2px var(--line),0 4px 16px rgba(59,130,246,.35)}
+/* ================ 高端交互升级 ================ */
+body::before{content:"";position:fixed;inset:-25%;z-index:-1;pointer-events:none;
+background:
+ radial-gradient(430px 340px at 18% 28%, rgba(99,102,241,.17), transparent 65%),
+ radial-gradient(470px 380px at 82% 16%, rgba(34,211,238,.13), transparent 65%),
+ radial-gradient(530px 430px at 60% 88%, rgba(139,92,246,.15), transparent 65%);
+animation:aurora 22s ease-in-out infinite alternate}
+@keyframes aurora{from{transform:translate3d(-2%,-1%,0) scale(1)}to{transform:translate3d(2%,2%,0) scale(1.08)}}
+html.light body::before{opacity:.5}
+.layout{animation:pageIn .45s ease both}
+@keyframes pageIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.card{animation:cardUp .5s cubic-bezier(.2,.8,.3,1) backwards;
+transition:transform .25s cubic-bezier(.2,.8,.3,1),box-shadow .25s,border-color .25s}
+@keyframes cardUp{from{opacity:0;transform:translateY(16px)}}
+.main .card:nth-child(2){animation-delay:.05s}.main .card:nth-child(3){animation-delay:.1s}
+.main .card:nth-child(4){animation-delay:.15s}.main .card:nth-child(5){animation-delay:.2s}
+.main .card:nth-child(n+6){animation-delay:.25s}
+.card:hover{transform:translateY(-2px);border-color:rgba(99,102,241,.4);
+box-shadow:0 16px 44px rgba(0,0,0,.28),0 0 0 1px rgba(99,102,241,.12)}
+html.light .card:hover{box-shadow:0 14px 34px rgba(31,45,61,.14)}
+.card h2{display:flex;align-items:center;gap:8px}
+.card h2::before{content:"";width:4px;height:16px;border-radius:4px;flex:none;
+background:linear-gradient(180deg,#60a5fa,#a78bfa);box-shadow:0 0 8px rgba(96,165,250,.6)}
+.pagehead h1{background:linear-gradient(92deg,var(--txt),var(--acc2));
+-webkit-background-clip:text;background-clip:text;color:transparent}
+.nav a{position:relative;transition:.2s}
+.nav a:hover{transform:translateX(3px)}
+.nav a.on::before{content:"";position:absolute;left:-1px;top:22%;bottom:22%;width:3px;border-radius:3px;
+background:linear-gradient(180deg,#60a5fa,#a78bfa);box-shadow:0 0 10px rgba(96,165,250,.9)}
+.btn{position:relative;overflow:hidden}
+.ink{position:absolute;border-radius:50%;background:rgba(255,255,255,.45);
+transform:scale(0);pointer-events:none;animation:inkAn .6s ease-out forwards}
+@keyframes inkAn{to{transform:scale(3.4);opacity:0}}
+.chip.on{animation:softPulse 2.4s infinite}
+@keyframes softPulse{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.4)}50%{box-shadow:0 0 0 7px rgba(34,197,94,0)}}
+.chip.warnch{color:var(--warn);border-color:var(--warn);background:rgba(234,179,8,.08)}
+.dot.on{animation:dotPulse 1.8s infinite}
+@keyframes dotPulse{0%,100%{box-shadow:0 0 6px var(--ok)}50%{box-shadow:0 0 16px var(--ok)}}
+.addr .big{transition:.4s}
+.addr .big.live{background:linear-gradient(90deg,#60a5fa,#a78bfa,#22d3ee,#60a5fa);
+background-size:300% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;
+animation:shineMove 7s linear infinite;text-shadow:none}
+@keyframes shineMove{to{background-position:300% 0}}
+.stat{transition:transform .22s,border-color .22s,box-shadow .22s}
+.stat:hover{transform:translateY(-3px);border-color:rgba(99,102,241,.45);
+box-shadow:0 10px 26px rgba(0,0,0,.22)}
+.stat .v.up{animation:numUp .5s cubic-bezier(.2,.9,.3,1.4)}
+@keyframes numUp{from{opacity:0;transform:translateY(8px) scale(.94)}}
+.trow{transition:background .2s;border-radius:10px}
+.trow:hover{background:rgba(255,255,255,.04)}
+html.light .trow:hover{background:rgba(0,0,0,.035)}
+.pills span:hover{transform:translateY(-1px);border-color:var(--acc)}
+.pills span{transition:.18s}
+.tmsg{position:relative;overflow:hidden;background:rgba(11,17,32,.94);color:var(--txt);
+border:1px solid rgba(99,102,241,.45);border-left:4px solid var(--acc);backdrop-filter:blur(14px);
+box-shadow:0 12px 36px rgba(0,0,0,.45)}
+html.light .tmsg{background:rgba(255,255,255,.95);border-color:rgba(42,107,198,.4);color:var(--txt)}
+.tmsg.err{border-color:rgba(239,68,68,.55);border-left-color:var(--bad)}
+.tmsg:before{content:"";position:absolute;left:0;right:0;bottom:0;height:2px;
+background:linear-gradient(90deg,var(--acc),transparent);animation:tprog 3.2s linear forwards}
+@keyframes tprog{from{transform:scaleX(1)}to{transform:scaleX(0)}}
+.mask{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;
+padding:20px;background:rgba(2,6,23,.6);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+animation:maskIn .18s ease}
+@keyframes maskIn{from{opacity:0}}
+.modal-box{width:450px;max-width:94vw;animation:popIn .3s cubic-bezier(.2,1.5,.4,1);
+background:linear-gradient(160deg,rgba(30,41,59,.97),rgba(15,23,42,.98));
+border:1px solid rgba(148,163,184,.25);border-radius:18px;padding:24px 26px 20px;
+box-shadow:0 30px 80px rgba(0,0,0,.55),0 0 0 1px rgba(99,102,241,.14)}
+html.light .modal-box{background:linear-gradient(160deg,rgba(255,255,255,.98),rgba(241,245,249,.98));
+border-color:rgba(100,116,139,.3)}
+@keyframes popIn{from{opacity:0;transform:scale(.9) translateY(14px)}to{opacity:1;transform:none}}
+.modal-box h3{font-size:17px;margin-bottom:8px;display:flex;gap:10px;align-items:center}
+.modal-box .mbd{color:var(--sub);font-size:14px;line-height:1.9;margin-bottom:18px}
+.modal-box .mbtns{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
+.banner.warn{background:linear-gradient(120deg,rgba(234,179,8,.12),rgba(234,179,8,.05));
+display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.banner.info{background:linear-gradient(120deg,rgba(59,130,246,.12),rgba(59,130,246,.05));
+border-color:var(--acc);color:var(--acc2);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.banner.block{display:block;line-height:1.95}
+.banner.block b.t{display:block;font-size:15px;margin-bottom:7px;letter-spacing:.3px}
+.banner.block p{margin:5px 0 0;padding-left:22px;position:relative}
+.banner.block p::before{content:"•";position:absolute;left:6px;top:0}
+.banner.block .hl{font-weight:bold;text-decoration:underline}
+.sv{border:1px solid var(--line);border-radius:12px;padding:10px 14px 6px;margin-bottom:12px}
+.svh{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px}
+.svh b{font-size:14px}
+.svh .sp{flex:1 1 40px;min-width:0}
+.sv input.bx{width:16px;height:16px;accent-color:var(--acc);cursor:pointer;vertical-align:middle}
+.sv td.old{opacity:.62}
+.dirlist{max-height:330px;overflow:auto;border:1px solid var(--line);border-radius:10px;
+padding:6px;margin:4px 0 14px;background:rgba(255,255,255,.03)}
+.ditem{display:block;width:100%;text-align:left;background:transparent;border:0;color:var(--txt);
+padding:8px 10px;border-radius:8px;cursor:pointer;font-size:14px;font-family:inherit}
+.ditem:hover{background:rgba(59,130,246,.15);color:var(--acc)}
+.dpath{font-size:12px;color:var(--sub);word-break:break-all;margin-bottom:4px}
+.modal-box.wide{width:560px}
+.modal-box .mbd{white-space:pre-line}
+.logo-img{transition:transform .3s,box-shadow .3s}
+.logo-img:hover{transform:rotate(-4deg) scale(1.08);
+box-shadow:0 0 0 2px var(--acc),0 8px 26px rgba(59,130,246,.5)}
+/* 防呆: 改过没保存的卡片描边 + 右下角提示条 */
+.card.dirty{border-color:var(--warn);
+box-shadow:0 10px 34px rgba(0,0,0,.22),0 0 0 1.5px rgba(234,179,8,.55)}
+.card.dirty h2::before{background:linear-gradient(180deg,#fde047,#f59e0b);
+box-shadow:0 0 10px rgba(253,224,71,.85)}
+#dzpill{position:fixed;right:22px;bottom:22px;z-index:150;cursor:pointer;
+display:flex;flex-direction:column;gap:1px;max-width:min(370px,62vw);
+background:linear-gradient(140deg,rgba(234,179,8,.17),rgba(15,23,42,.94));
+border:1px solid var(--warn);border-left:4px solid var(--warn);border-radius:14px;
+padding:11px 16px;color:var(--txt);font-size:12px;line-height:1.65;
+box-shadow:0 16px 44px rgba(0,0,0,.5);backdrop-filter:blur(14px);
+animation:dzin .3s cubic-bezier(.2,1.5,.4,1)}
+#dzpill b{color:var(--warn);font-size:13.5px;letter-spacing:.3px}
+#dzpill span{color:var(--sub);word-break:break-all}
+#dzpill i{font-style:normal;color:var(--acc2);font-size:11.5px;margin-top:3px}
+html.light #dzpill{background:linear-gradient(140deg,rgba(234,179,8,.2),rgba(255,255,255,.96))}
+@keyframes dzin{from{opacity:0;transform:translateY(16px)}}
+
+/* 侧边栏: 项目仓库入口 (置于「存档」那一行上方, 只显示图标与名称, 不显示网址) */
+.repo{display:flex;align-items:center;justify-content:center;gap:7px;margin:0 0 12px;
+padding:7px 11px;border-radius:999px;border:1px solid rgba(255,255,255,.1);
+background:linear-gradient(140deg,rgba(139,92,246,.16),rgba(59,130,246,.12));
+color:var(--sub);font-size:11.5px;letter-spacing:.3px;text-decoration:none;transition:.24s}
+.repo svg{width:15px;height:15px;fill:currentColor;flex:none;transition:.24s}
+.repo:hover{color:var(--txt);border-color:var(--acc);transform:translateY(-1px);
+box-shadow:0 8px 22px rgba(0,0,0,.32)}
+.repo:hover svg{transform:scale(1.14) rotate(-8deg)}
+html.light .repo{border-color:rgba(0,0,0,.1);
+background:linear-gradient(140deg,rgba(139,92,246,.13),rgba(59,130,246,.09))}
+
+/* 彩蛋: 连点 5 次图标 → 贡献者名单 */
+.side .logo{cursor:pointer;user-select:none;-webkit-user-select:none}
+.logo-img.tap{animation:tapback .26s ease-out}
+@keyframes tapback{40%{transform:scale(.86) rotate(-6deg)}}
+.crow{display:flex;align-items:center;gap:11px;padding:9px 12px;margin-top:9px;
+border:1px solid rgba(255,255,255,.09);border-radius:12px;background:rgba(148,163,184,.08)}
+.crow .cav{width:33px;height:33px;border-radius:10px;flex:none;display:grid;place-items:center;
+font-size:16px;color:#fff;background:linear-gradient(135deg,#3b82f6,#8b5cf6);
+box-shadow:0 6px 16px rgba(59,130,246,.32)}
+.crow b{font-size:14.5px}
+.crow i{font-style:normal;display:block;font-size:11px;color:var(--sub);margin-top:1px}
+.crow em{font-style:normal;margin-left:auto;font-size:11px;color:var(--acc2);
+padding:3px 8px;border-radius:999px;border:1px solid rgba(129,140,248,.35);flex:none}
+html.light .crow{border-color:rgba(0,0,0,.07);background:rgba(15,23,42,.045)}
+.cthanks{margin-top:14px;font-size:12.5px;line-height:1.8;color:var(--sub);
+border-left:3px solid var(--acc2);padding-left:11px}
 """
 
 # 白天/黑夜切换开关 (Uiverse.io by RiccardoRapelli)
@@ -1585,19 +2516,121 @@ function onThemeSwitch(cb){
  h.classList.toggle('light',!cb.checked);
  localStorage.setItem('untheme',cb.checked?'dark':'light');}
 function closeManager(){
- if(!confirm('确定关闭开服器程序吗? (游戏服务器不受影响, 继续在后台运行)'))return;
- post('/api/manager/shutdown').finally(()=>{document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#94a3b8;font-size:16px">开服器已关闭, 可以关闭此页面了</div>';});}
-function toast(msg,err){var w=document.getElementById('toast');var d=document.createElement('div');
+ modal({icon:'⏻',title:'确定关闭开服器程序吗?',body:'游戏服务器不受影响, 继续在后台运行。',
+  okText:'关闭程序',noText:'取消',danger:true}).then(function(ok){
+ if(!ok)return;
+ post('/api/manager/shutdown').finally(()=>{document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#94a3b8;font-size:16px">开服器已关闭, 可以关闭此页面了</div>';});});}
+function toast(msg,err){var w=document.getElementById('toast');if(!w)return;var d=document.createElement('div');
 d.className='tmsg'+(err?' err':'');d.textContent=msg;w.appendChild(d);
+while(w.children.length>5)w.firstChild.remove();
 setTimeout(()=>d.remove(),3200);}
 function post(url,body){return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
 body:JSON.stringify(body||{})}).then(r=>{
  if(r.status===401){location.href='/login';throw new Error('unauth');}
  return r.json();});}
+/* ---- 玻璃拟态弹窗: 返回 Promise(true=确认/false=取消) ---- */
+function modal(o){return new Promise(function(res){
+ var m=document.createElement('div');m.className='mask';
+ var box=document.createElement('div');box.className='modal-box';
+ var h=document.createElement('h3');h.textContent=(o.icon?o.icon+'  ':'')+(o.title||'');
+ var bd=document.createElement('div');bd.className='mbd';bd.textContent=o.body||'';
+ var bt=document.createElement('div');bt.className='mbtns';
+ var no=document.createElement('button');no.className='btn gray';no.textContent=o.noText||'忽略';
+ var okb=document.createElement('button');okb.className='btn'+(o.danger?' red':'');okb.textContent=o.okText||'确定';
+ bt.appendChild(no);bt.appendChild(okb);
+ box.appendChild(h);box.appendChild(bd);box.appendChild(bt);m.appendChild(box);
+ document.body.appendChild(m);
+ function done(v){m.remove();res(v);}
+ no.onclick=function(){done(false);};
+ okb.onclick=function(){done(true);};
+ m.addEventListener('click',function(e){if(e.target===m)done(false);});
+ document.addEventListener('keydown',function esc(e){
+  if(e.key==='Escape'){document.removeEventListener('keydown',esc);done(false);}});
+});}
+/* ---- 玻璃拟态弹窗(多按钮): 返回 Promise(点击项的 v) ---- */
+function pick(o){return new Promise(function(res){
+ var m=document.createElement('div');m.className='mask';
+ var box=document.createElement('div');box.className='modal-box';
+ var h=document.createElement('h3');h.textContent=(o.icon?o.icon+'  ':'')+(o.title||'');
+ var bd=document.createElement('div');bd.className='mbd';bd.textContent=o.body||'';
+ var bt=document.createElement('div');bt.className='mbtns';
+ function done(v){m.remove();res(v);}
+ (o.btns||[]).forEach(function(b){
+  var el=document.createElement('button');
+  el.className='btn'+(b.cls?' '+b.cls:'');el.textContent=b.t;
+  el.onclick=function(){done(b.v);};bt.appendChild(el);});
+ box.appendChild(h);box.appendChild(bd);box.appendChild(bt);m.appendChild(box);
+ document.body.appendChild(m);
+ m.addEventListener('click',function(e){if(e.target===m)done(o.cancel||'stay');});
+ document.addEventListener('keydown',function esc(e){
+  if(e.key==='Escape'){document.removeEventListener('keydown',esc);done(o.cancel||'stay');}});
+});}
+/* ---- 彩蛋: 连点左上角图标 5 次 → 贡献者名单 ---- */
+var CREDITS=[
+ ['💻','Pippl','Dawn Sharkk 作者 · 界面 / 功能 / 文档','作者'],
+ ['🧪','Nmaomao','功能测试','测试'],
+ ['🪟','爱情是件奢侈品','Windows 11 适配测试','测试']];
+function showCredits(){
+ if(document.querySelector('.mask[data-cred]'))return;
+ var m=document.createElement('div');m.className='mask';m.setAttribute('data-cred','1');
+ var box=document.createElement('div');box.className='modal-box';
+ var h=document.createElement('h3');h.textContent='🦈 Dawn Sharkk 贡献者';
+ var bd=document.createElement('div');
+ CREDITS.forEach(function(c){
+  var r=document.createElement('div');r.className='crow';
+  var av=document.createElement('div');av.className='cav';av.textContent=c[0];
+  var tx=document.createElement('div');
+  var nm=document.createElement('b');nm.textContent=c[1];
+  var rl=document.createElement('i');rl.textContent=c[2];
+  tx.appendChild(nm);tx.appendChild(rl);
+  var bg=document.createElement('em');bg.textContent=c[3];
+  r.appendChild(av);r.appendChild(tx);r.appendChild(bg);bd.appendChild(r);});
+ var th=document.createElement('div');th.className='cthanks';
+ th.textContent='感谢 Nmaomao 与 爱情是件奢侈品 两位测试员的帮助 —— 一个个坑都是他们踩出来的, '+
+  'Dawn Sharkk 才有今天这个稳定度。';
+ var bt=document.createElement('div');bt.className='mbtns';
+ var okb=document.createElement('button');okb.className='btn';okb.textContent='知道啦';
+ bt.appendChild(okb);
+ box.appendChild(h);box.appendChild(bd);box.appendChild(th);box.appendChild(bt);
+ m.appendChild(box);document.body.appendChild(m);
+ function done(){m.remove();}
+ okb.onclick=done;
+ m.addEventListener('click',function(e){if(e.target===m)done();});
+ document.addEventListener('keydown',function esc(e){
+  if(e.key==='Escape'){document.removeEventListener('keydown',esc);done();}});
+}
+(function(){
+ var n=0,last=0;
+ document.addEventListener('click',function(e){
+  var nd=e.target&&e.target.closest?e.target.closest('.side .logo'):null;
+  if(!nd)return;
+  if(window.getSelection)window.getSelection().removeAllRanges();
+  var now=Date.now();
+  n=(now-last>900)?1:n+1;last=now;
+  var img=nd.querySelector('.logo-img');
+  if(img){img.classList.remove('tap');void img.offsetWidth;img.classList.add('tap');}
+  if(n>=5){n=0;showCredits();}
+ },true);
+})();
+function rocketChoice(title,bodyTxt){return modal({icon:'🚀',title:title,body:bodyTxt,
+ okText:'开启 Rocket 前置插件',noText:'忽略'});}
+async function doRocketInstall(){
+ toast('正在通过 Install Rocket.bat 安装, 约需 30~60 秒…');
+ var r=await post('/api/rocket/install');
+ toast(r.msg,r.ok?0:1);refreshStatus();return r;}
+function openRocket(){
+ var s=(lastStatus&&lastStatus.rocket)||{};
+ if(s.installed){toast('Rocket 前置插件已安装 🚀 插件 dll 放进存档的 Rocket/Plugins 文件夹即可');return;}
+ if(!s.bat){toast('游戏目录 Extras 里没有 Install Rocket.bat — 请先在 Steam 校验游戏完整性',1);return;}
+ rocketChoice('如需使用更多功能请开启 Rocket 前置插件',
+  '开启 Rocket 前置插件后可加载 .dll 插件、使用 RCON 指令与玩家管理等功能。'+
+  '将运行游戏自带 Extras 里的 Install Rocket.bat 完成安装, 装完重启服务器生效。')
+ .then(function(go){if(go)doRocketInstall();else sessionStorage.setItem('rkIgnored','1');});}
+var lastStatus=null;
 async function refreshStatus(){
  try{var r=await fetch('/api/status');
  if(r.status===401){location.href='/login';return;}
- var d=await r.json();
+ var d=await r.json();lastStatus=d;
  var chip=document.getElementById('chip');var dot=document.getElementById('dot');
  if(chip){chip.textContent=d.running?('运行中 · PID '+(d.pid>0?d.pid:'外部')):'未运行';
  chip.className='chip '+(d.running?'on':'off');}
@@ -1607,12 +2640,30 @@ async function refreshStatus(){
  document.querySelectorAll('[data-show-run]').forEach(e=>e.style.display=d.running?'':'none');
  document.querySelectorAll('[data-show-stop]').forEach(e=>e.style.display=d.running?'none':'');
  var bc=document.getElementById('bigcode');
- if(bc){bc.textContent=d.code?d.code:'开服后自动出现在这里…';
+ if(bc){var idle='暂时没有启动服务器喔，启动服务器后联机代码会提示在这里';
+ bc.textContent=d.code?d.code:(d.running?'服务器正在启动, 地图加载到 100% 后代码会出现在这里…':idle);
+ bc.classList.toggle('idle',!d.code);
+ bc.classList.toggle('live',!!d.code);
+ var tip=document.getElementById('codetip');
+ if(tip)tip.style.display=d.code?'':'none';
  var lk=document.getElementById('codelink');
  if(lk)lk.style.display=d.code?'':'none';}
+ var rk=document.getElementById('rkchip');
+ if(rk&&d.rocket){rk.textContent=d.rocket.installed?'🚀 Rocket 已装':'🚀 Rocket 未安装';
+ rk.className='chip'+(d.rocket.installed?'':' warnch');}
+ var rk2=document.getElementById('st-rk');
+ if(rk2&&d.rocket)rk2.textContent=d.rocket.installed?'✅ 已安装':'⭕ 未安装';
+ var st=document.getElementById('st-port');
+ if(st&&d.port)st.textContent=d.port;
+ var ch=document.getElementById('st-cheat');
+ if(ch){var v=d.cheat?'✅ 已开启':'⭕ 未开启';
+ if(ch.textContent!==v){ch.textContent=v;ch.classList.remove('up');void ch.offsetWidth;ch.classList.add('up');}}
+ var ban=document.getElementById('rkban');
+ if(ban&&d.rocket)ban.style.display=(!d.rocket.installed&&!sessionStorage.getItem('rkIgnored'))?'':'none';
  }catch(e){}}
 function initGlass(){
  document.querySelectorAll('.pills').forEach(g=>{
+  if(g.classList.contains('glass'))return;
   var radios=g.querySelectorAll('input[type=radio]');
   if(!radios.length)return;
   g.classList.add('glass');
@@ -1626,45 +2677,143 @@ function initGlass(){
   radios.forEach(r=>r.addEventListener('change',move));
   move();});}
 initGlass();
+/* 按钮水波纹 */
+document.addEventListener('click',function(e){
+ var b=e.target.closest('.btn');if(!b||b.disabled)return;
+ var rc=b.getBoundingClientRect(),s=Math.max(rc.width,rc.height);
+ var i=document.createElement('span');i.className='ink';
+ i.style.width=i.style.height=s+'px';
+ i.style.left=(e.clientX-rc.left-s/2)+'px';i.style.top=(e.clientY-rc.top-s/2)+'px';
+ b.appendChild(i);setTimeout(()=>i.remove(),650);});
+/* 开服/关服/重启 按钮 */
 document.querySelectorAll('[data-act]').forEach(b=>b.addEventListener('click',async()=>{
  var a=b.dataset.act;
- if(a=='stop'&&!confirm('确定要关闭服务器吗?\\n开服器会先自动保存世界, 再安全关闭。'))return;
- if(a=='restart'&&!confirm('确定要重启服务器吗? 也会自动保存世界。'))return;
+ if(a=='stop'&&!(await modal({icon:'⛔',title:'确定要关闭服务器吗?',
+   body:'开服器会先自动保存世界, 再安全关闭。',okText:'关服',noText:'取消',danger:true})))return;
+ if(a=='restart'&&!(await modal({icon:'🔄',title:'确定要重启服务器吗?',
+   body:'重启前同样会自动保存世界。',okText:'重启',noText:'取消',danger:true})))return;
+ if(a=='start'&&lastStatus&&lastStatus.rocket&&!lastStatus.rocket.installed
+    &&!sessionStorage.getItem('rkIgnored')){
+  var useRk=await rocketChoice('未检测到 Rocket 前置插件',
+   '如需使用更多功能请开启 Rocket 前置插件 (加载 .dll 插件、RCON 指令、玩家管理、丰富日志)。'+
+   '将通过游戏目录 Extras 文件夹里的 Install Rocket.bat 自动安装, 不影响本次开服。');
+  if(useRk)await doRocketInstall();
+  else sessionStorage.setItem('rkIgnored','1');}
  b.disabled=true;var r=await post('/api/'+a);b.disabled=false;toast(r.msg,r.ok?0:1);
  setTimeout(refreshStatus,1200);}));
 syncThemeSwitch();
 refreshStatus();setInterval(refreshStatus,4000);
 """
 
+# 防呆脚本: 只在带 DIRTY_GROUPS 的页面注入 (服务器设置 / 玩法设置)
+DIRTY_JS = """
+/* ================= 防呆: 设置改过没保存, 切页 / 开服前先问一句 ================= */
+(function(){
+ var GS=((typeof DIRTY_GROUPS=='undefined')?[]:DIRTY_GROUPS).filter(function(g){
+  return g.save&&document.querySelector(g.sel);});
+ if(!GS.length)return;
+ function each(g,fn){var j=0;
+  document.querySelectorAll(g.sel).forEach(function(nd){
+   nd.querySelectorAll('input,select,textarea').forEach(function(el){
+    if(el.closest('[data-auto]'))return;      /* 勾选即自动保存的项目不算改动 */
+    fn(el,j++);});});}
+ function snap(g){var m={};each(g,function(el,i){
+  m[i]=(el.type=='checkbox'||el.type=='radio')?String(el.checked):el.value;});return m;}
+ function restore(g){each(g,function(el,i){
+  var v=g.base[i];
+  if(el.type=='checkbox'||el.type=='radio')el.checked=(v=='true');
+  else el.value=(v===undefined?'':v);});
+  if(g.fix)g.fix(); initGlass();}
+ GS.forEach(function(g){g.base=snap(g);});
+ function changed(g){var m=snap(g),n=0,k;
+  for(k in g.base){n++;if(m[k]!==g.base[k])return true;}
+  for(k in m){if(g.base[k]===undefined)return true;}
+  return n!==Object.keys(m).length;}
+ function dirty(){return GS.filter(changed);}
+ var pill=document.createElement('div');
+ pill.id='dzpill';pill.style.display='none';
+ pill.title='点这里跳到第一个没保存的卡片';
+ var pb=document.createElement('b'),ps=document.createElement('span'),pi=document.createElement('i');
+ pi.textContent='点这里定位 →';pill.appendChild(pb);pill.appendChild(ps);pill.appendChild(pi);
+ document.body.appendChild(pill);
+ pill.onclick=function(){var g=dirty()[0];if(!g)return;
+  document.querySelector(g.sel).scrollIntoView({behavior:'smooth',block:'center'});
+  toast('本页「'+g.name+'」改过了, 要点下面的保存才写进配置文件',1);};
+ function paint(){
+  var d=dirty();
+  document.querySelectorAll('[data-grp]').forEach(function(nd){nd.classList.remove('dirty');});
+  if(!d.length){pill.style.display='none';return;}
+  d.forEach(function(g){document.querySelectorAll(g.sel).forEach(function(nd){
+   if(nd.classList.contains('card'))nd.classList.add('dirty');});});
+  pb.textContent='⚠ 有 '+d.length+' 处修改还没保存';
+  ps.textContent=d.map(function(g){return g.name;}).join(' · ');
+  pill.style.display='';}
+ document.addEventListener('input',paint,true);
+ document.addEventListener('change',paint,true);
+ window.dirtySaved=function(sel){GS.forEach(function(g){if(g.sel==sel)g.base=snap(g);});paint();};
+ window.dirtyCheck=paint;
+ var busy=false;
+ function target(e){
+  var el=e.target&&e.target.closest?e.target.closest('a[href],[data-act]'):null;
+  if(!el)return null;
+  if(el.tagName=='A'){
+   var h=el.getAttribute('href')||'';
+   return (h.charAt(0)=='/'&&h!='/api/logout')?{node:el,kind:'nav',href:h}:null;}
+  var a=el.getAttribute('data-act');
+  return (a=='start'||a=='restart')?{node:el,kind:a}:null;}
+ function ask(t,d){
+  var names=d.map(function(g){return '「'+g.name+'」';}).join(' ');
+  var act=t.kind=='nav'?'切到别的页面':'开服 / 重启服务器';
+  return pick({icon:'⚠️',title:'这些设置改了还没保存',
+   body:'你改动的 '+names+' 还没点保存, 直接'+act+'的话这些改动不会生效。\\n要先保存吗? (保存后仍需重启服务器才在游戏里生效)',
+   btns:[{v:'discard',t:'🗑 取消更改',cls:'gray'},
+         {v:'stay',t:'留在本页',cls:'gray'},
+         {v:'save',t:'💾 先保存再继续'}]}).then(function(v){
+   if(v=='stay')return false;
+   if(v=='discard'){d.forEach(restore);paint();return true;}
+   return Promise.all(d.map(function(g){
+    try{return Promise.resolve(g.save()).catch(function(){return null;});}
+    catch(e){return null;}})).then(function(){
+     if(dirty().length){toast('还有设置没保存成功, 请按页面上的红色提示处理',1);return false;}
+     return true;});});}
+ document.addEventListener('click',function(e){
+  if(busy)return;
+  var t=target(e);if(!t)return;
+  var d=dirty();if(!d.length)return;
+  e.preventDefault();e.stopPropagation();
+  busy=true;
+  ask(t,d).then(function(go){busy=false;if(!go)return;
+   if(t.kind=='nav')location.href=t.href;else t.node.click();});
+ },true);
+ window.addEventListener('beforeunload',function(e){
+  if(!dirty().length)return;
+  e.preventDefault();e.returnValue='';});
+ paint();
+})();
+"""
 
-def torch_html(checked=False, onchange="", ident="", cls=""):
-    """3D 火把勾选框 (Uiverse.io by kelvyn_8843), checked=点燃"""
-    face4 = "<div></div>" * 4
-    side16 = "<div></div>" * 16
-    attrs = (f'id="{ident}"' if ident else "") + (" checked" if checked else "") + f' {onchange}'
-    return (f'<label class="container {cls}">'
+
+def check_html(checked=False, onchange="", ident="", label="", cls="", style=""):
+    """玻璃质感勾选框 (Uiverse.io 模板), cls="ck-lg" 为大号"""
+    attrs = ((f' id="{ident}"' if ident else "") + (" checked" if checked else "")
+             + (f" {onchange}" if onchange else ""))
+    lbl = f'<span class="lbl">{label}</span>' if label else ""
+    st = f' style="{style}"' if style else ""
+    return (f'<label class="container {cls}"{st}>'
             f'<input type="checkbox"{attrs}>'
-            f'<span class="torch">'
-            f'<span class="head">'
-            f'<span class="face top">{face4}</span>'
-            f'<span class="face left">{face4}</span>'
-            f'<span class="face right">{face4}</span>'
-            f'</span>'
-            f'<span class="stick">'
-            f'<span class="face side side-left">{side16}</span>'
-            f'<span class="face side side-right">{side16}</span>'
-            f'</span>'
-            f'</span>'
-            f'</label>')
+            f'<span class="checkmark"></span>{lbl}</label>')
 
 
-def shell(page, title, content, script=""):
+def shell(page, title, content, script="", dirty=False):
     IC = {
         "dash": '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
         "quick": '<path d="M13 2L5 13h6l-1.5 9L19 9.5h-6.2L13 2z"/>',
         "cmds": '<rect x="2.5" y="7" width="19" height="10" rx="5"/><path d="M7 12h4M9 10v4"/><circle cx="15.5" cy="11" r="0.6"/><circle cx="17.5" cy="13" r="0.6"/>',
         "game": '<path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="2.2"/><circle cx="15" cy="17" r="2.2"/>',
         "ws": '<path d="M21 8l-9-5-9 5v8l9 5 9-5V8z"/><path d="M3 8l9 5 9-5M12 13v8"/>',
+        "save": ('<ellipse cx="12" cy="5.5" rx="8" ry="2.8"/>'
+                 '<path d="M4 5.5v5.6c0 1.6 3.6 2.8 8 2.8s8-1.2 8-2.8V5.5"/>'
+                 '<path d="M4 11.1v5.6c0 1.6 3.6 2.8 8 2.8s8-1.2 8-2.8v-5.6"/>'),
         "term": '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>',
         "log": '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6z"/><path d="M14 3v6h6M9 13h6M9 17h4"/>',
         "files": '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>',
@@ -1676,6 +2825,7 @@ def shell(page, title, content, script=""):
         ("cmds", "服务器设置", "/commands"),
         ("game", "玩法设置", "/gameplay"),
         ("ws", "创意工坊", "/workshop"),
+        ("save", "存档管理", "/saves"),
         ("term", "控制台", "/console"),
         ("log", "操作日志", "/logs"),
         ("files", "文件管理", "/files"),
@@ -1685,7 +2835,9 @@ def shell(page, title, content, script=""):
         f'<a href="{href}" class="{"on" if key == page else ""}">'
         f'<span class="ico"><svg viewBox="0 0 24 24">{IC[key]}</svg></span>{name}</a>'
         for key, name, href in nav)
-    foot = (f'存档: <b>{esc(instance())}</b> · <a href="/setup">切换/重设</a>'
+    foot = (f'<a class="repo" href="{esc(REPO_URL)}" target="_blank" rel="noopener noreferrer"'
+            f' title="在项目页面看源码 / 提 issue / 求 star">{GH_ICON}<span>项目仓库地址</span></a>'
+            f'存档: <b>{esc(instance())}</b> · <a href="/setup">切换/重设</a>'
             f' · <a href="/api/logout">退出登录</a><br>'
             f'<a href="#" onclick="closeManager();return false">关闭开服器程序</a><br>'
             f'<span class="dot" id="dot"></span><span id="foot-st">检测中…</span>')
@@ -1701,7 +2853,7 @@ if(t)localStorage.setItem('untheme',t);}}catch(e){{}}</script>
 <aside class="side">
   <div class="logo"><img class="logo-img" src="/logo.png" style="width:58px;height:58px" alt="Dawn Sharkk">
   <div><b>Dawn Sharkk</b>
-  <div class="sub">Unturned 开服器 · by Pippl</div></div></div>
+  <div class="sub">Unturned 开服器 v{VERSION} · by Pippl</div></div></div>
   <nav class="nav">{links}</nav>
   <div class="foot">{foot}</div>
 </aside>
@@ -1709,38 +2861,70 @@ if(t)localStorage.setItem('untheme',t);}}catch(e){{}}</script>
 <div id="toast"></div>
 <div class="pagehead"><h1>{title}</h1>
 <span class="chip" id="chip">检测中…</span>
+<span class="chip" id="rkchip" onclick="openRocket()" title="Rocket 前置插件状态, 点击查看/开启" style="cursor:pointer">🚀 检测中…</span>
 <span style="flex:1"></span>
-<button class="btn green" data-act="start" data-show-stop>开服</button>
-<button class="btn gray" data-act="restart" data-show-run>重启</button>
-<button class="btn red" data-act="stop" data-show-run>关服</button>
+<button class="btn green" data-act="start" data-show-stop>▶ 开服</button>
+<button class="btn gray" data-act="restart" data-show-run>🔄 重启</button>
+<button class="btn red" data-act="stop" data-show-run>⛔ 关服</button>
 {THEME_SWITCH}
 </div>
 {content}
 </main></div>
 <script>{SHELL_JS}
-{script}</script></body></html>"""
+{script}
+{DIRTY_JS if dirty else ""}</script></body></html>"""
 
 
 # ================================================================ 仪表盘
 def page_dash():
     info = cmd_info()
+    cheat_on = cheat_enabled()
+    check_rows = ""
+    for t in TOGGLES:
+        if t["id"] not in DASH_TOGGLE_IDS:
+            continue
+        on = all(get_cfg(config_txt(), s, k) == v for s, k, v in t["keys"])
+        chk = check_html(on, onchange='onchange="dashTog(\'%s\',this)"' % t["id"],
+                         ident="d_" + t["id"], cls="ck-lg")
+        check_rows += f"""
+<div class="trow" style="padding:9px 4px">
+{chk}<div style="flex:1;min-width:0"><b style="font-size:14px">{t['icon']} {t['name']}</b>
+<div class="ds" style="font-size:12px">{t['desc']}</div></div></div>"""
+    cheat_check = check_html(cheat_on, onchange='onchange="setCheat(this)"',
+                             ident="d_cheat", cls="ck-lg")
     content = f"""
+<div class="banner warn" id="rkban" style="display:none">🚀 未检测到 Rocket 前置插件 — 如需使用更多功能请开启 Rocket 前置插件 (加载插件 / RCON 指令 / 玩家管理)
+<span style="flex:1"></span>
+<button class="btn sm" onclick="doRocketInstall()">立即开启</button>
+<button class="btn sm gray" onclick="ignoreRocket()">忽略</button></div>
 <div class="card addr">
+  <button class="btn sm gray rfbtn" id="rfbtn" onclick="refreshCode(this)"
+   title="立即刷新服务器状态与代码"><span class="ric">↻</span>刷新</button>
   <div class="lb">服 务 器 代 码 ( P2P 直 连 )</div>
-  <div class="big" id="bigcode">开服后自动出现在这里…</div>
-  <div class="tip">开服后把这段 <b>服务器代码</b> 发给你的朋友 → 游戏内按 <b>Play → 输入服务器代码</b> 即可加入, 无需端口映射</div>
+  <div class="big idle" id="bigcode">暂时没有启动服务器喔，启动服务器后联机代码会提示在这里</div>
+  <div class="tip" id="codetip">开服后把这段 <b>服务器代码</b> 发给你的朋友 → 游戏内按 <b>Play → 输入服务器代码</b> 即可加入, 无需端口映射</div>
   <div style="margin-top:18px">
     <button class="button" onclick="copyCode()" id="codelink" style="display:none"><span class="hoverEffect"><div></div></span><span class="txt">复制服务器代码</span></button>
   </div>
-  <div class="hint" style="margin-top:14px">同一 WiFi/局域网的朋友也可以直接连: <b id="st-ip">…</b> (游戏内 Play → 直连)</div>
+  <div class="hint" style="margin-top:14px">本服走 Steam P2P, 只提供<b>服务器代码</b>联机 (IP+端口直连需要官方服务器和 Steam 服务器 Key, 本工具不适用)</div>
 </div>
-<div class="grid g4">
+<div class="grid g3">
   <div class="stat"><div class="k">服务器名称</div><div class="v">{esc(info['name'])}</div></div>
-  <div class="stat"><div class="k">地图</div><div class="v">{esc(info['map'])}</div></div>
-  <div class="stat"><div class="k">难度</div><div class="v">{esc(info['mode'])}</div></div>
+  <div class="stat"><div class="k">地图 · 难度</div><div class="v">{esc(info['map'])} · {esc(info['mode'])}</div></div>
   <div class="stat"><div class="k">人数上限</div><div class="v">{esc(info['maxplayers'])}</div></div>
+  <div class="stat"><div class="k">端口</div><div class="v" id="st-port">{esc(info['port'])}</div></div>
+  <div class="stat"><div class="k">作弊选项 (cheats on)</div><div class="v" id="st-cheat">{'✅ 已开启' if cheat_on else '⭕ 未开启'}</div></div>
+  <div class="stat"><div class="k">Rocket 前置</div><div class="v" id="st-rk">检测中…</div></div>
 </div>
-<div class="grid g2" style="margin-top:14px">
+<div class="card" style="margin-top:14px"><h2>默认开服选项</h2>
+<div class="desc">下面每一项都会<b>立即应用到当前服务器</b> (重启生效), 并自动保存为<b>以后新建服务器的默认设置</b>。</div>
+<div class="trow" style="border-bottom:1px solid rgba(255,255,255,.06)">
+{cheat_check}<div style="flex:1;min-width:0"><b style="font-size:14px">🎮 默认开启作弊</b>
+<div class="ds">往 Commands.dat 写入 <code class="k">cheats on</code> — check/give/vehicle/teleport/god 等管理指令可用;
+新建服务器时默认自带。建议只在和朋友联机时开启。</div></div></div>
+<div class="grid g2">{check_rows}</div>
+</div>
+<div class="grid g2">
   <div class="card"><h2>新手推荐</h2>
     <div class="desc">不想研究复杂配置? 到「一键设置」页, 点开关就能调好服务器</div>
     <div style="margin-top:10px"><a class="btn" href="/quick">打开一键设置 →</a></div></div>
@@ -1755,13 +2939,35 @@ def page_dash():
 <div class="desc" style="line-height:2">
 · 修改任何配置前请先 <b>关服</b>, 改完再开服, 否则修改会被覆盖<br>
 · 点「关服」按钮会先自动保存世界再安全关闭, 请放心使用<br>
-· 服务器代码每次开服可能会变化, 以最新显示的为准<br>
-· 以后往 <code class="k">Rocket\\Plugins</code> 里放插件, 它的配置文件会自动出现在文件管理里
+· 服务器代码每次开服都会变化, 所以只在服务器运行时显示; 而且<b>一定要地图加载到 100% 之后才会出现</b>,
+刚点开服时看到「服务器正在启动」是正常现象, 过十几秒再刷新即可 (右上角「↻ 刷新」可立刻重新拉取)<br>
+· 建议定期去 <b>存档管理</b> 备份建筑存档 / 玩家存档; 在那里删存档会先强制备份, 删的只是文件不是文件夹<br>
+· 「一键设置」里有 <b>无需指南针/GPS/手绘地图也能看方向和地图</b> 三个开关, 萌新不再迷路;
+服务器 <b>图标与大厅链接</b> 在「服务器设置」页最底下 (新建存档已自动带上 Dawn Sharkk 默认图标)<br>
+· 以后往 <code class="k">Rocket\\Plugins</code> 里放插件, 它的配置文件会自动出现在文件管理里<br>
+· 朋友进不去服务器? <b>「帮助」页最上方有一张置顶的「🚨 进不去服务器」对照表</b>
+(连接超时 / Steam 经济验证 / 战眼未开 / 其他报错), 让他对着自己的提示词照着做 → <a href="/help">立即查看</a>
 </div></div>
 """
     script = """
 function copyCode(){navigator.clipboard.writeText(document.getElementById('bigcode').textContent)
  .then(()=>toast('✔ 服务器代码已复制, 发给朋友即可加入'));}
+async function refreshCode(btn){btn.disabled=true;btn.classList.add('spin');
+ await refreshStatus();
+ setTimeout(function(){btn.disabled=false;btn.classList.remove('spin');},600);
+ var d=lastStatus||{};
+ if(d.running&&d.code)toast('服务器代码: '+d.code);
+ else if(d.running)toast('服务器还在启动中: 必须等地图加载到 100% 才显示本次服务器代码, 过几秒再刷新');
+ else toast('服务器未运行, 开服后联机代码会显示在这里');}
+async function setCheat(el){el.disabled=true;
+ var r=await post('/api/cheat',{on:el.checked});toast(r.msg,r.ok?0:1);
+ if(!r.ok)el.checked=!el.checked;el.disabled=false;}
+async function dashTog(id,el){el.disabled=true;
+ var r=await post('/api/toggle',{id:id,on:el.checked,as_default:true});
+ toast(r.msg,r.ok?0:1);if(!r.ok)el.checked=!el.checked;el.disabled=false;}
+function ignoreRocket(){sessionStorage.setItem('rkIgnored','1');
+ var b=document.getElementById('rkban');if(b)b.style.display='none';
+ toast('已忽略 — 随时点右上角 🚀 徽章开启 Rocket');}
 """
     return shell("dash", "仪表盘", content, script)
 
@@ -1772,14 +2978,14 @@ def page_quick():
     for t in TOGGLES:
         on = all(get_cfg(config_txt(), s, k) == v for s, k, v in t["keys"])
         keys = "".join(f'<code class="k">{k}</code>' for _, k, _ in t["keys"])
-        torch = torch_html(on, onchange='onchange="toggle(\'%s\',this)"' % t["id"],
-                           ident="sw_" + t["id"], cls="torch-lg")
+        chk = check_html(on, onchange='onchange="toggle(\'%s\',this)"' % t["id"],
+                         ident="sw_" + t["id"], cls="ck-lg")
         rows.append(f"""
 <div class="trow"><div class="bar"></div>
 <div><div class="nm">{t['name']}</div><div class="ds">{t['desc']}</div>
 <div class="st {'on' if on else 'off'}" id="st_{t['id']}">当前: {'✅ 已开启' if on else '⭕ 未开启 (默认)'}</div>
 <div style="margin-top:5px">{keys}</div></div>
-<div class="rgt">{torch}</div></div>""")
+<div class="rgt">{chk}</div></div>""")
 
     sel_rows = []
     for s in SELECTS:
@@ -1795,6 +3001,27 @@ def page_quick():
 <div style="margin-top:4px"><code class="k">{s['key']}</code></div></div>
 <div class="rgt"><div class="pills">{pills}</div></div></div>""")
 
+    rz = rocket_zh_status()
+    rz_now = "✅ 已汉化 (指令反馈)" if rz["on"] else "⭕ 当前是英文原文"
+    if rz["missing"]:
+        rz_now = "⭕ 存档里还没有 Rocket 翻译文件 (需先装 Rocket 前置并开一次服)"
+    rz_check = check_html(rz["on"], onchange='onchange="rkZh(this)"',
+                          ident="sw_rkzh", cls="ck-lg")
+    rk_zh_card = f"""
+<div class="card"><h2>🚀 Rocket 前置 · 指令反馈汉化</h2>
+<div class="desc">注意: <b>这不是汉化控制台</b>, 服务器日志和控制台输出不受影响。
+只汉化<b>玩家或管理员敲完指令之后 Rocket 回的那一句话</b> (例如 /tp、/give、/god 的提示,
+以及玩家进服、权限不足、插件加载完成之类的反馈)。
+开启后会把存档 <code class="k">Rocket\\</code> 里的
+<code class="k">Rocket.en.translation.xml</code> 与
+<code class="k">Rocket.Unturned.en.translation.xml</code> 覆盖为中文版 (共 95 条文案,
+原文会自动保留在文件结构里), 关掉开关即可逐字还原成英文。改完重启服务器生效。</div>
+<div class="trow"><div class="bar"></div>
+<div><div class="nm">汉化 Rocket 指令反馈</div>
+<div class="ds">只改反馈文字, 不动指令本身、不动控制台、不影响插件功能</div>
+<div class="st {'on' if rz['on'] else 'off'}" id="st_rkzh">当前: {rz_now}</div></div>
+<div class="rgt">{rz_check}</div></div></div>"""
+
     content = f"""
 <div class="card"><h2>一键开关</h2>
 <div class="desc">点一下开关就生效并自动保存到 Config.txt, 关掉开关恢复游戏默认。改完记得重启服务器。</div>
@@ -1802,6 +3029,7 @@ def page_quick():
 <div class="card"><h2>常用强度</h2>
 <div class="desc">选一个想要的档位即可, 自动写入配置。</div>
 {''.join(sel_rows)}</div>
+{rk_zh_card}
 <div class="card"><h2>更多精细调节</h2>
 <div class="desc">想调血量、刷车率、技能消耗等更多参数? 去「玩法设置」页, 每一项都有中文说明。</div>
 <div style="margin-top:10px"><a class="btn gray" href="/gameplay">打开玩法设置 →</a></div></div>
@@ -1819,6 +3047,15 @@ async function toggle(id,el){
 async function setsel(id,val,el){
  var r=await post('/api/select',{id:id,value:val==='OFF'?null:val});
  toast(r.msg,r.ok?0:1);if(!r.ok)el.checked=false;}
+async function rkZh(el){
+ el.disabled=true;
+ var r=await post('/api/rocketzh',{on:el.checked});
+ el.disabled=false;
+ if(!r.ok){el.checked=!el.checked;toast(r.msg,1);return;}
+ var st=document.getElementById('st_rkzh');
+ st.textContent='当前: '+(el.checked?'✅ 已汉化 (指令反馈)':'⭕ 当前是英文原文');
+ st.className='st '+(el.checked?'on':'off');
+ toast(r.msg,0);}
 """
     return shell("quick", "一键设置", content, script)
 
@@ -1836,8 +3073,7 @@ def page_commands():
     rocket_note = "· 检测到 Modules\\Rocket.Unturned" if rocket_ok else "· 不安装的话 Rocket 插件不会加载"
     text, _ = read_file(commands_path())
     entries = parse_commands(text)
-    known = {k for k, *_ in CMD_FIELDS} | {"pvp", "pve"}
-    maps = list_maps()
+    known = {k for k, *_ in CMD_FIELDS} | {"pvp", "pve", "cheat", "cheats"}
     vals = {}
     for e in entries:
         if e["key"] and e["key"].lower() in known:
@@ -1858,9 +3094,17 @@ def page_commands():
                                         ("both", "都可以 (推荐)"), ("vehicle", "载具内第三人称")])
     pvpve = pills("pvpve", [("pvp", "⚔️ PVP 玩家对战"), ("pve", "🧟 PVE 只打僵尸")])
 
+    cur_map = (vals.get("map") or "").strip()
+    detected = list_maps()
+    unknown_map = bool(cur_map) and cur_map.lower() not in {m.lower() for m in detected}
+    # 存档里写的地图探测不到 (创意工坊还没下载 / 手填的名字): 也要原样显示, 绝不能假装是 PEI
+    maps = ([cur_map] + detected) if unknown_map else detected
     map_opts = '<option value="">— 选择地图 —</option>' + "".join(
-        f'<option value="{m}" {"selected" if vals.get("map", "").lower() == m else ""}>{m}</option>'
+        f'<option value="{esc(m)}" {"selected" if cur_map.lower() == m.lower() else ""}>'
+        f'{esc(m)}{" (探测不到, 请核对拼写)" if unknown_map and m == cur_map else ""}</option>'
         for m in maps)
+    map_state = ("Commands.dat 当前写入的地图: " + cur_map) if cur_map \
+        else "还没设置地图 (游戏会用默认的 PEI)"
     others = [e for e in entries if e["key"] and e["key"].lower() not in known
               and e["key"].lower() != "pvpve"]
     other_html = ""
@@ -1869,17 +3113,61 @@ def page_commands():
             f'<div><label class="f"><b>{esc(e["key"])}</b><code class="k">{esc(e["key"])}</code></label>'
             f'<input class="f" data-key="{esc(e["key"])}" value="{esc(e["value"])}"></div>'
             for e in others)
-        other_html = f'<div class="card"><h2>其他配置项 (自动识别)</h2><div class="grid g3">{rows}</div></div>'
+        other_html = (f'<div class="card" data-grp="cmd"><h2>其他配置项 (自动识别)</h2>'
+                      f'<div class="grid g3">{rows}</div></div>')
+
+    try:
+        apply_browser_defaults()          # 没设置过的存档自动补上默认图标与链接
+    except OSError:
+        pass
+    bi = browser_cfg()
+    has_br = bool(bi["icon"] or bi["thumb"] or bi["links"])
+    cur_links = esc("\n".join(f"{m} | {u}" for m, u in bi["links"]))
+    def_links = "&#10;".join(f"{m} | {u}" for m, u in BROWSER_DEFAULTS["links"])
+    br_state = ("✅ 已设置 (图标 " + ("有" if bi["icon"] else "无")
+                + " · 链接 " + str(len(bi["links"])) + " 条)") if has_br \
+        else "⭕ 未设置 (游戏默认, 大厅不显示图标)"
+    browser_card = f"""
+<div class="card" data-grp="br"><h2>🖼️ 服务器图标与大厅链接 (图床设置)</h2>
+<div class="desc">这几项写在当前存档 <code class="k">Config.txt</code> 的 <code class="k">Browser</code> 段
+(本页其他项目改的是 Commands.dat, 只有这一块写 Config.txt, 两者互不影响):
+<code class="k">Icon</code> = 玩家进服大厅左上角的图标(建议 64x64),
+<code class="k">Thumbnail</code> = 服务器列表里的小图(建议 32x32),
+<code class="k">Links</code> = 大厅里玩家能点的按钮 (群地址、GitHub 地址等)。
+<b>图片必须是能直接访问的图片直链</b> (以 .jpg / .png 结尾的图床地址), 由玩家客户端自行下载;
+留空 = 用游戏默认 (不显示图标)。<b>新建存档会自动填入 Dawn Sharkk 默认图标与 GitHub 链接</b>,
+已有的存档只会在<b>第一次</b>打开时自动补齐一次, 之后你自己改过或清掉的值不会再被覆盖。
+改完重启服务器生效。</div>
+<div id="brcard" data-icon="{esc(BROWSER_DEFAULTS['icon'])}" data-thumb="{esc(BROWSER_DEFAULTS['thumb'])}" data-links="{def_links}">
+<label class="f"><b>图标 Icon</b><code class="k">Browser/Icon</code></label>
+<input class="f" id="bi_icon" value="{esc(bi['icon'])}" placeholder="https://.../icon-64x64.png">
+<label class="f"><b>缩略图 Thumbnail</b><code class="k">Browser/Thumbnail</code></label>
+<input class="f" id="bi_thumb" value="{esc(bi['thumb'])}" placeholder="https://.../thumb-32x32.png">
+<label class="f"><b>大厅链接 Links</b><code class="k">Browser/Links</code>
+<span style="font-size:12px"> 每行一条: 显示文字 | 网址 (最多 8 条)</span></label>
+<textarea class="f" id="bi_links" rows="3">{cur_links}</textarea>
+<div class="st {'on' if has_br else 'off'}" id="st_br">当前: {br_state}</div>
+<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+<button class="btn big" onclick="saveBr()">💾 保存并写入 Config.txt</button>
+<button class="btn gray" onclick="fillBrDef()">↺ 填入 Dawn Sharkk 默认</button>
+<button class="btn gray" onclick="clearBr()">🗑 清空输入框</button></div>
+<div class="hint" style="margin-top:8px">「清空输入框」只是把框里的字清掉, 要点「保存」才会真的写进配置
+(保存时留空 = 恢复游戏默认, 大厅不再显示图标)。</div>
+</div></div>"""
 
     content = f"""
-<div class="card"><h2>基础信息</h2>
+<div class="card" data-grp="cmd"><h2>基础信息</h2>
 <div class="grid g2">
 <div><label class="f"><b>服务器名称</b><code class="k">name</code></label>
 <input class="f" data-key="name" id="i_name" value="{esc(vals.get('name',''))}"></div>
-<div><label class="f"><b>地图</b><code class="k">map</code></label>
-<select class="f" id="i_map">{map_opts}</select>
-<label class="f" style="font-size:12px">地图列表里没有? 在这里自己填:</label>
-<input class="f" id="i_map_custom" placeholder="手动输入地图名"></div>
+<div><label class="f"><b>地图</b><code class="k">Map &lt;地图名&gt;</code></label>
+<select class="f" id="i_map" onchange="showMap()">{map_opts}</select>
+<label class="f" style="font-size:12px">列表里没有你要的地图? 在这里照原样填 (填了就优先生效):</label>
+<input class="f" id="i_map_custom" placeholder="手动输入地图名" oninput="showMap()">
+<div class="st on" id="st_map">{map_state}</div>
+<div class="hint">下拉框读的是 <code class="k">U3DS\\Maps</code> 和存档 <code class="k">Level</code> 里<b>真实存在的地图名</b>
+(大小写照原样)。创意工坊地图要先在「创意工坊」页订阅, 开服时才会自动下载。<b>换地图 = 换一张全新的世界</b>:
+建筑会重新生成, 老地图的建筑存档仍然保留在 <code class="k">Level\\旧地图名</code> 里, 名字改回去就能看到。</div></div>
 </div>
 <div class="grid g2">
 <div><label class="f"><b>最大玩家数</b><code class="k">maxplayers</code></label>
@@ -1889,13 +3177,17 @@ def page_commands():
 <div class="hint">多个存档同时开服时端口不能相同</div></div>
 </div></div>
 
-<div class="card"><h2>游戏方式</h2>
+<div class="card" data-grp="cmd"><h2>游戏方式</h2>
 <div><label class="f"><b>对战模式</b><code class="k">PVP / PVE</code></label>
 <div class="pills">{pvpve}</div></div>
 <div><label class="f"><b>游戏难度</b><code class="k">mode</code></label>
 <div class="pills">{mode_pills}</div></div>
 <div><label class="f"><b>允许的视角</b><code class="k">perspective</code></label>
 <div class="pills">{persp_pills}</div></div>
+<div><label class="f"><b>开启作弊</b><code class="k">cheats on</code></label>
+<div style="display:flex;gap:14px;align-items:center">
+{check_html(cheat_enabled(), onchange='data-auto="1" onchange="setCheat(this)"', ident="i_cheat", cls="ck-lg")}
+<span class="hint" style="margin:0">勾选 = 往 Commands.dat 写入 <code class="k">cheats on</code>, check/give/teleport 等管理指令可用; 与仪表盘「默认开服选项」保持同步</span></div></div>
 <div><label class="f"><b>进服欢迎语</b><code class="k">welcome</code></label>
 <input class="f" data-key="welcome" value="{esc(vals.get('welcome',''))}"></div>
 <div><label class="f"><b>出生装备</b><code class="k">loadout</code></label>
@@ -1908,22 +3200,22 @@ def page_commands():
 <input class="f" data-key="owner" value="{esc(vals.get('owner',''))}"></div>
 </div>
 {other_html}
-<div class="card"><h2>启动参数</h2>
+<div class="card" data-grp="launch"><h2>启动参数</h2>
 <div class="desc">启动命令固定为原版方式: <code class="k">-nographics -batchmode +Secureserver/存档名</code>。
 改完下面的选项点保存并重启服务器生效。</div>
 <div class="tip">萌新联机只需要用<b>服务器代码</b> (仪表盘正中间那串数字): 代码联机走 Steam P2P,
 <b>不需要</b> <code class="k">Login_Token</code>、不需要端口映射。不填 Login_Token 只影响"互联网服务器列表
 / 公网 IP 直连"这两种方式, 代码联机不受任何影响。</div>
 <div style="margin-top:12px;display:flex;gap:16px 24px;flex-wrap:wrap;align-items:center">
-{torch_html(lc['console'], ident="l_console", cls="torch-lg")}<span><b>原版控制台窗口</b> (推荐) — 服务器有自己独立的黑色控制台窗口, 关闭开服器/网页后<b>服务器继续运行</b></span>
+{check_html(lc['console'], ident="l_console", cls="ck-lg")}<span><b>原版控制台窗口</b> (推荐) — 服务器有自己独立的黑色控制台窗口, 关闭开服器/网页后<b>服务器继续运行</b></span>
 </div>
 <div style="margin-top:10px;display:flex;gap:16px 24px;flex-wrap:wrap;align-items:center">
-{torch_html(lc['batchmode'], ident="l_batch")}<span><b>-batchmode</b> 无窗口后台运行 (推荐, 默认勾选)</span>
-{torch_html(lc['nographics'], ident="l_nographics")}<span><b>-nographics</b> 不加载显卡渲染 (推荐, 默认勾选)</span>
+{check_html(lc['batchmode'], ident="l_batch", cls="ck-lg")}<span><b>-batchmode</b> 无窗口后台运行 (推荐, 默认勾选)</span>
+{check_html(lc['nographics'], ident="l_nographics", cls="ck-lg")}<span><b>-nographics</b> 不加载显卡渲染 (推荐, 默认勾选)</span>
 </div>
 <div class="hint">"原版控制台窗口"关闭时: 服务器完全后台静默运行, 网页「运行日志」会更完整(实时接管输出)。</div>
 <div style="margin-top:12px;display:flex;gap:16px 24px;flex-wrap:wrap;align-items:center">
-{torch_html(close_stop, ident="l_closestop", cls="torch-lg")}<span><b>关闭 bat 窗口时同时关闭服务器</b> (默认关闭 — 关闭后服务器会一直驻留, 直到手动关服)</span>
+{check_html(close_stop, ident="l_closestop", cls="ck-lg")}<span><b>关闭 bat 窗口时同时关闭服务器</b> (默认关闭 — 关闭后服务器会一直驻留, 直到手动关服)</span>
 </div>
 <label class="f"><b>自定义附加参数</b><code class="k">extra</code></label>
 <input class="f" id="l_extra" value="{esc(lc['extra'])}" placeholder="用空格分隔, 不确定就不要填">
@@ -1946,26 +3238,38 @@ def page_commands():
 <div class="card">
 <button class="btn big" onclick="save()">💾 保存修改</button>
 <a class="btn big gray" href="/edit?path=Server/Commands.dat">原始编辑器</a>
-<span class="hint" style="margin-left:12px">保存后需要重启服务器才会生效</span></div>
+<span class="hint" style="margin-left:12px">保存后需要重启服务器才会生效 —— 改过没保存就切页或开服, 会弹框提醒并帮你直接保存</span></div>
+{browser_card}
 """
     script = """
+function mapVal(){
+ var c=document.getElementById('i_map_custom').value.trim();
+ return c||document.getElementById('i_map').value.trim();}
+function showMap(){
+ var v=mapVal(),st=document.getElementById('st_map');
+ st.textContent=v?('保存后将写入 Commands.dat: Map '+v):'⚠ 地图不能为空, 请选一个或手动填一个';
+ st.className='st '+(v?'on':'off');}
 function save(){
- var kv={};var bad='';
+ var kv={};var bad='';var LB={maxplayers:'最大玩家数',port:'端口'};
  document.querySelectorAll('input.f[data-key]').forEach(el=>{
   var v=el.value.trim();
   if(el.dataset.key==='maxplayers'||el.dataset.key==='port'){
-   if(v!==''&&!/^[0-9]+$/.test(v))bad=el.dataset.key;}
+   if(!/^[0-9]+$/.test(v))bad=(LB[el.dataset.key]||el.dataset.key)+' 要填数字, 不能留空';}
   kv[el.dataset.key]=v;});
- var c=document.getElementById('i_map_custom').value.trim();
- if(c)kv.map=c;
+ var mp=mapVal();
+ if(!mp){toast('地图不能为空: 请从下拉框选一个地图, 或在下面手动填写地图名',1);return;}
+ kv.map=mp;
  var mode=document.querySelector('input[name=p_mode]:checked');
  if(mode)kv.mode=mode.value;
  var pv=document.querySelector('input[name=p_pvpve]:checked');
  if(pv)kv[pv.value]='';
  var pe=document.querySelector('input[name=p_perspective]:checked');
  if(pe)kv.perspective=pe.value;
- if(bad){toast('「'+bad+'」应该填数字',1);return;}
- post('/api/commands',{kv:kv}).then(r=>toast(r.ok?'✔ 已保存! 重启服务器后生效':'✘ '+r.msg,r.ok?0:1));}
+ if(bad){toast('✘ '+bad,1);return;}
+ return post('/api/commands',{kv:kv}).then(r=>{
+  if(!r.ok){toast('✘ '+(r.msg||'保存失败'),1);return;}
+  if(window.dirtySaved)dirtySaved('[data-grp=cmd]');
+  toast(r.warn?('⚠ 已保存, 但'+r.warn):'✔ 已保存! 重启服务器后生效',r.warn?1:0);});}
 async function saveLaunch(){
  var r=await post('/api/launch',{
   batchmode:document.getElementById('l_batch').checked,
@@ -1973,15 +3277,44 @@ async function saveLaunch(){
   console:document.getElementById('l_console').checked,
   close_stop:document.getElementById('l_closestop').checked,
   extra:document.getElementById('l_extra').value.trim()});
+ if(r.ok&&window.dirtySaved)dirtySaved('[data-grp=launch]');
  toast(r.msg,r.ok?0:1);}
+async function setCheat(el){el.disabled=true;
+ var r=await post('/api/cheat',{on:el.checked});toast(r.msg,r.ok?0:1);
+ if(!r.ok)el.checked=!el.checked;el.disabled=false;}
 async function installRocket(){
- if(!confirm('确定安装/更新 Rocket 吗? 安装来源为游戏自带的 Install Rocket.bat。'))return;
- toast('正在安装, 请稍候…');
- var r=await post('/api/rocket/install');
- toast(r.msg,r.ok?0:1);setTimeout(()=>location.reload(),1500);}
+ if(!(await modal({icon:'🚀',title:'安装 / 更新 Rocket',
+  body:'将运行游戏自带 Extras 里的 Install Rocket.bat。安装完成后重启服务器生效。'})))return;
+ var r=await doRocketInstall();if(r.ok)setTimeout(()=>location.reload(),1500);}
 function openPlugins(){post('/api/rocket/open');}
+function brVal(id){return document.getElementById(id).value.trim();}
+async function saveBr(){
+ var i=brVal('bi_icon'), t=brVal('bi_thumb'), l=document.getElementById('bi_links').value;
+ if(i&&!/^https?:\/\//i.test(i)){toast('图标 Icon 必须是 http:// 或 https:// 开头的图片直链',1);return;}
+ if(t&&!/^https?:\/\//i.test(t)){toast('缩略图 Thumbnail 必须是 http:// 或 https:// 开头的图片直链',1);return;}
+ var r=await post('/api/browser',{icon:i,thumb:t,links:l});
+ toast(r.msg,r.ok?0:1);
+ if(r.ok){if(window.dirtySaved)dirtySaved('[data-grp=br]');
+  var st=document.getElementById('st_br');
+ st.textContent='当前: '+(i||t||r.links?'✅ 已设置 (图标 '+(i?'有':'无')+' · 链接 '+r.links+' 条)':'⭕ 未设置 (游戏默认, 大厅不显示图标)');
+ st.className='st '+(i||t||r.links?'on':'off');}}
+function fillBrDef(){var c=document.getElementById('brcard'), d=c.dataset;
+ document.getElementById('bi_icon').value=d.icon;
+ document.getElementById('bi_thumb').value=d.thumb;
+ document.getElementById('bi_links').value=d.links;
+ if(window.dirtyCheck)dirtyCheck();
+ toast('已填入 Dawn Sharkk 默认图标与链接, 记得点保存');}
+function clearBr(){['bi_icon','bi_thumb','bi_links'].forEach(function(id){
+ document.getElementById(id).value='';});
+ if(window.dirtyCheck)dirtyCheck();
+ toast('输入框已清空 — 点保存即恢复游戏默认(不显示图标)');}
+/* 防呆登记: 这三块各有自己的保存按钮 */
+var DIRTY_GROUPS=[
+ {sel:'[data-grp=cmd]',name:'基础信息与游戏方式',save:save,fix:showMap},
+ {sel:'[data-grp=launch]',name:'启动参数',save:saveLaunch},
+ {sel:'[data-grp=br]',name:'图标与大厅链接',save:saveBr}];
 """
-    return shell("cmds", "服务器设置", content, script)
+    return shell("cmds", "服务器设置", content, script, dirty=True)
 
 
 # ================================================================ 玩法设置 (Config.txt 汉化表单)
@@ -2005,7 +3338,7 @@ def page_gameplay():
                        f'<div class="hint">留空 = 使用游戏默认值</div>')
             rows += f"""<div><label class="f"><b>{label}</b><code class="k">{key}</code></label>{inp}</div>"""
         sections_html += f"""
-<div class="card"><h2>{sec_cn} <code class="k">{sec}</code></h2>
+<div class="card" data-grp="game"><h2>{sec_cn} <code class="k">{sec}</code></h2>
 <div class="grid g3">{rows}</div></div>"""
 
     content = f"""
@@ -2015,7 +3348,8 @@ def page_gameplay():
 {sections_html}
 <div class="card">
 <button class="btn big" onclick="save()">💾 保存全部修改</button>
-<a class="btn big gray" href="/edit?path=Config.txt">原始编辑器</a></div>
+<a class="btn big gray" href="/edit?path=Config.txt">原始编辑器</a>
+<span class="hint" style="margin-left:12px">改过没保存就切页或开服, 会弹框提醒并帮你直接保存</span></div>
 """
     script = """
 async function save(){
@@ -2027,12 +3361,141 @@ async function save(){
   var p=el.id.slice(2).split('|');
   kv[p[0]+'|'+p[1]]=el.value.trim()===''?null:el.value.trim();});
  var r=await post('/api/gameplay',{kv:kv});
+ if(r.ok&&window.dirtySaved)dirtySaved('[data-grp=game]');
  toast(r.ok?'✔ 已保存! 重启服务器后生效 (共 '+r.count+' 项)':'✘ '+r.msg,r.ok?0:1);}
+/* 防呆登记: 整页共用一个保存按钮 */
+var DIRTY_GROUPS=[{sel:'[data-grp=game]',name:'玩法参数',save:save}];
 """
-    return shell("game", "玩法设置", content, script)
+    return shell("game", "玩法设置", content, script, dirty=True)
 
 
 # ================================================================ 创意工坊
+WS_INFO_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
+WS_COLL_API = "https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/"
+_ws_cache = {}
+_ws_lock = threading.Lock()
+
+
+def ws_extract_ids(text):
+    """从创意工坊网址或混排文本里提取模组 ID (网址里的 ?id=数字 或纯数字)"""
+    s = re.sub(r"id\s*=\s*", " ", text or "", flags=re.I)
+    out, seen = [], set()
+    for m in re.finditer(r"\d{6,}", s):
+        v = m.group(0)
+        if v not in seen:
+            seen.add(v)
+            out.append(int(v))
+    return out
+
+
+def _steam_post(url, payload, timeout=8):
+    req = urllib.request.Request(
+        url, data=urlencode(payload).encode(), method="POST",
+        headers={"User-Agent": "DawnSharkk", "Content-Type":
+                 "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _ws_date(v):
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(int(v)))
+    except Exception:
+        return "—"
+
+
+def _ws_fetch(ids):
+    """批量查询模组详情, 返回 ({id: 条目}, 错误文本)"""
+    out, err = {}, ""
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        payload = {f"publishedfileids[{n}]": pid for n, pid in enumerate(chunk)}
+        payload["itemcount"] = len(chunk)
+        payload["details"] = 1
+        try:
+            data = _steam_post(WS_INFO_API, payload)
+        except urllib.error.HTTPError as e:
+            err = f"Steam 接口返回状态 {e.code} (可能是短时间内查询过多), 稍等几秒再试"
+            continue
+        except Exception as e:
+            err = f"连不上 Steam 接口 ({type(e).__name__}), 请检查网络后重试"
+            continue
+        for d in (data.get("response") or {}).get("publishedfiledetails") or []:
+            try:
+                pid = int(d.get("publishedfileid"))
+            except (TypeError, ValueError):
+                continue
+            ok = d.get("result") in (None, 1)
+            out[pid] = {
+                "id": pid,
+                "title": d.get("title") or ("已删除/不可见" if not ok else "未知名称"),
+                "updated": _ws_date(d.get("time_updated")),
+                "created": _ws_date(d.get("time_created")),
+                "dead": not ok,
+                "url": f"https://steamcommunity.com/sharedfiles/filedetails/?id={pid}",
+            }
+    return out, err
+
+
+def workshop_info(ids):
+    """查询模组名称与最后更新时间; 合集(收藏)自动展开为里面的子模组。失败不抛异常"""
+    ids = list(dict.fromkeys(int(i) for i in ids))[:300]
+    if not ids:
+        return [], "没有识别到模组 ID"
+    colls = {}
+    try:
+        payload = {f"publishedfileids[{n}]": pid for n, pid in enumerate(ids)}
+        payload["itemcount"] = payload["collectioncount"] = len(ids)
+        data = _steam_post(WS_COLL_API, payload)
+        for d in (data.get("response") or {}).get("collectiondetails") or []:
+            kids = [int(c["publishedfileid"]) for c in d.get("children") or []
+                    if str(c.get("publishedfileid", "")).isdigit()]
+            if kids and str(d.get("publishedfileid", "")).isdigit():
+                colls[int(d["publishedfileid"])] = kids
+    except Exception:
+        colls = {}          # 合集展开失败不影响主查询
+    extra = [c for kids in colls.values() for c in kids if c not in ids]
+    need = ids + list(dict.fromkeys(extra))
+    with _ws_lock:
+        cached = {i: _ws_cache[i] for i in need if i in _ws_cache}
+    fresh, err = _ws_fetch([i for i in need if i not in cached])
+    found = dict(cached)
+    found.update(fresh)
+    with _ws_lock:
+        for pid, item in fresh.items():
+            _ws_cache[pid] = item
+    rows, missing = [], []
+    for pid in ids:
+        if pid in colls:
+            base = dict(found.get(pid) or {})
+            kids = [dict(found[k], child=True) for k in colls[pid] if k in found]
+            rows.append({
+                "id": pid,
+                "title": (base.get("title") or "合集 / 收藏包") +
+                         f" 〔合集, 含 {len(colls[pid])} 个子模组〕",
+                "updated": base.get("updated") or "—",
+                "created": base.get("created") or "—",
+                "dead": bool(base.get("dead")),
+                "url": f"https://steamcommunity.com/sharedfiles/filedetails/?id={pid}",
+                "kids": kids,
+            })
+        elif pid in found:
+            rows.append(found[pid])
+        else:
+            missing.append(pid)
+    if err and not rows:
+        return rows, err
+    if err:
+        rows.append({"id": 0, "title": err, "updated": "—", "created": "—",
+                     "dead": True, "url": "", "kids": [], "warn": True})
+    if missing:
+        rows.append({"id": 0, "title": "未查到: " + ", ".join(map(str, missing)) +
+                     " (可能已删除、设为私有, 或网址里其实是游戏/物品 ID)",
+                     "updated": "—", "created": "—", "dead": True, "url": "",
+                     "kids": [], "warn": True})
+    return rows, ""
+
+
 def page_workshop():
     full = os.path.join(server_dir(), "WorkshopDownloadConfig.json")
     try:
@@ -2042,34 +3505,247 @@ def page_workshop():
     ids_text = "\n".join(str(i) for i in data.get("File_IDs", []))
     ign_text = "\n".join(str(i) for i in data.get("Ignore_IDs", []))
     content = f"""
-<div class="card"><h2>要下载的模组 ID <code class="k">File_IDs</code></h2>
-<div class="desc">在 Steam 创意工坊模组页面的网址里找 <code class="k">id=数字</code>, 那串数字就是模组 ID。
-服务器启动时会自动下载, 玩家进服也会自动加载。每行填一个。</div>
-<textarea class="f" id="ids" rows="7" style="margin-top:10px">{esc(ids_text)}</textarea></div>
+<div class="banner warn block"><b class="t">⚠️ 安装创意工坊内容前，请先看完这几句</b>
+<p>创意工坊内容可能导致服务器<b class="hl">崩溃、冲突或进不去服务器</b>，请各位妥善安装创意工坊内容。</p>
+<p>如果出现<b class="hl">启动时长时间卡死</b>，可使用 steam302 软件进行网络调试来解决该问题。</p>
+<p>请各位最好安装<b class="hl">熟悉或多人在订阅</b>的模组；陌生模组可能会通过 unturned 本地漏洞
+<b class="hl">非法侵入本地计算机</b>。</p></div>
+<div class="card"><h2>要下载的模组 <code class="k">File_IDs</code></h2>
+<div class="desc">把 Steam 创意工坊模组页面的<b>完整网址</b>直接粘进来就行（每行一个），开服器会自动提纯网址里的数字 ID，
+只填数字也可以，合集/收藏包网址同样支持。服务器启动时会自动下载，玩家进服也会自动加载。</div>
+<div class="hint" id="hit" style="margin-top:8px"></div>
+<textarea class="f" id="ids" rows="7" style="margin-top:10px" oninput="hintIds()"
+ placeholder="https://steamcommunity.com/sharedfiles/filedetails/?id=123456789&#10;https://steamcommunity.com/sharedfiles/filedetails/?id=987654321&#10;或者直接写数字: 666777888">{esc(ids_text)}</textarea>
+<div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;align-items:center">
+<button class="btn" id="qbtn" onclick="wsQuery()">🔍 查询模组信息</button>
+<button class="btn big" onclick="save()">💾 保存</button>
+</div>
+<div class="hint" style="margin-top:8px">「查询模组信息」会联网访问 Steam 官方接口，用来确认模组名称与最后更新时间；
+查询失败不影响保存，离线时直接填 ID 保存即可。</div>
+<div id="wsres"></div></div>
 <div class="card"><h2>忽略的模组 ID <code class="k">Ignore_IDs</code></h2>
-<div class="desc">一般不用填。</div>
+<div class="desc">一般不用填。支持同样写法（网址或数字），填写后服务器会跳过这些模组。</div>
 <textarea class="f" id="ign" rows="4" style="margin-top:10px">{esc(ign_text)}</textarea></div>
-<div class="card"><button class="btn big" onclick="save()">💾 保存</button></div>
 """
     script = """
+function wsIds(t){
+ var s=(t===undefined?document.getElementById('ids').value:t).replace(/id\\s*=\\s*/gi,' ');
+ var m=s.match(/\\d{6,}/g)||[],seen={},out=[];
+ m.forEach(function(v){if(!seen[v]){seen[v]=1;out.push(v);}});
+ return out;}
+function hintIds(){var n=wsIds().length,e=document.getElementById('hit');
+ e.textContent=n?('已识别到 '+n+' 个模组 ID (输入框里的网址会被自动提纯成数字)'):'';}
+function el(p,tag,txt,cls){var e=document.createElement(tag);
+ if(txt!=null)e.textContent=txt;if(cls)e.className=cls;p.appendChild(e);return e;}
+function modRow(tb,m){
+ var tr=tb.insertRow(),c0=el(tr,'td');
+ el(c0,'b',(m.child?'└ ':'')+m.title);
+ if(m.dead)el(c0,'div','⚠ 可能已删除、设为私有或无法访问','hint');
+ el(tr,'td',String(m.id));el(tr,'td',m.updated||'—');el(tr,'td',m.created||'—');
+ if(m.url){var a=el(el(tr,'td'),'a','创意工坊页面');a.href=m.url;a.target='_blank';a.rel='noopener';}
+ else el(tr,'td','—');}
+async function wsQuery(){
+ var ids=wsIds();
+ var box=document.getElementById('wsres');
+ if(!ids.length){toast('先粘贴创意工坊网址或模组 ID',1);return;}
+ box.innerHTML='';
+ var btn=document.getElementById('qbtn');btn.disabled=true;
+ var card=el(box,'div',null,'card');
+ el(card,'h2','查询中…').id='wshd';
+ var tip=el(card,'div','正在联网查询 Steam 创意工坊 ('+ids.length+' 个)，请稍候','hint');
+ var r=null;
+ try{r=await post('/api/workshop/info',{ids:ids.map(Number)});}
+ catch(e){r={ok:false,msg:'网络请求失败: '+e};}
+ finally{btn.disabled=false;tip.remove();}
+ card.querySelector('h2').textContent=r&&r.ok?'查询结果':'查询失败';
+ if(!r||!r.ok){
+  var w=el(card,'div',null,'banner warn');
+  w.textContent=(r&&r.msg||'未知错误')+' — 不影响直接保存';return;}
+ var t=el(card,'table');
+ el(t,'thead').innerHTML='<tr><th>模组名称</th><th>模组 ID</th><th>最后更新</th><th>首次发布</th><th></th></tr>';
+ var tb=el(t,'tbody');
+ (r.items||[]).forEach(function(m){
+  modRow(tb,m);
+  (m.kids||[]).forEach(function(k){modRow(tb,k);});});
+ if(r.err)el(card,'div',r.err,'hint');}
 async function save(){
- var parse=t=>t.split(/\\s+/).map(s=>s.trim()).filter(s=>/^[0-9]+$/.test(s)).map(Number);
- var r=await post('/api/workshop',{ids:parse(document.getElementById('ids').value),
-  ignores:parse(document.getElementById('ign').value)});
- toast(r.ok?'✔ 已保存, 重启服务器后生效':'✘ '+r.msg,r.ok?0:1);}
+ var ids=wsIds().map(Number);
+ var ign=wsIds(document.getElementById('ign').value).map(Number);
+ var r=await post('/api/workshop',{ids:ids,ignores:ign});
+ if(r.ok){
+  document.getElementById('ids').value=ids.join('\\n');
+  document.getElementById('ign').value=ign.join('\\n');
+  hintIds();
+  toast('✔ 已保存 (网址已提纯为 '+ids.length+' 个 ID), 重启服务器后生效');}
+ else toast('✘ '+(r&&r.msg||'保存失败'),1);}
+hintIds();
 """
     return shell("ws", "创意工坊", content, script)
+
+
+# ================================================================ 存档管理 (备份 / 删除)
+def page_saves():
+    inv = save_inventory()
+    sd = server_dir()
+    suggested = os.path.join(BASE_DIR, "存档备份")
+
+    def file_rows(files):
+        out = ""
+        for r in files:
+            out += (f'<tr><td><input class="bx" type="checkbox" value="{esc(r["rel"])}"></td>'
+                    f'<td><b>{esc(os.path.basename(r["rel"]))}</b></td>'
+                    f'<td class="hint{" old" if r["old"] else ""}">{esc(r["desc"])}</td>'
+                    f'<td class="hint">{human_size(r["size"])}</td>'
+                    f'<td class="hint">{esc(r["mtime"])}</td></tr>')
+        return out or '<tr><td colspan="5" class="hint">这个文件夹里没有存档文件</td></tr>'
+
+    def grp_html(gid, title, sub, files):
+        return f"""<div class="sv" id="{gid}">
+<div class="svh"><b>{title}</b><span class="hint">{sub}</span><span class="sp"></span>
+<button class="btn sm gray" onclick="pickAll('{gid}',true)">全选</button>
+<button class="btn sm gray" onclick="pickAll('{gid}',false)">取消全选</button>
+<button class="btn sm" onclick="backup('{gid}','all')">📦 整体备份</button>
+<button class="btn sm" onclick="backup('{gid}','sel')">⬇ 备份勾选</button>
+<button class="btn sm red" onclick="del('{gid}')">🗑 备份后删除勾选</button></div>
+<table><tr><th style="width:34px"></th><th>文件</th><th>这是什么存档</th><th>大小</th><th>最后保存</th></tr>
+{file_rows(files)}</table></div>"""
+
+    lv_html = "".join(
+        grp_html(f"L{n}", f"🏠 地图 {esc(g['map'])}",
+                 f"{len(g['files'])} 个建筑存档文件 · 共 {human_size(g['size'])}", g["files"])
+        for n, g in enumerate(inv["level"])) or \
+        '<div class="hint">这个存档还没有建筑存档文件 (Level 文件夹是空的) — 开服并进游戏建东西后回来看看。</div>'
+
+    pl_html = "".join(
+        grp_html(f"P{n}", f"🧑 玩家 {esc(p['id'])}",
+                 f"地图 {'/'.join(map(esc, p['maps'])) or '—'} · {len(p['files'])} 个文件 · 共 {human_size(p['size'])}",
+                 p["files"])
+        for n, p in enumerate(inv["players"])) or \
+        '<div class="hint">还没有玩家进过服 (Players 文件夹是空的), 所以没有玩家存档可备份。</div>'
+
+    allp = "PALL"
+    if inv["players"]:
+        pl_html = f"""<div id="{allp}">
+<div class="svh" style="margin-bottom:10px"><b>👥 全部玩家 ({len(inv['players'])} 人)</b>
+<span class="hint">整体备份所有人的玩家存档; 删除则是先备份再删掉这些人的存档</span>
+<span class="sp"></span>
+<button class="btn sm gray" onclick="pickAll('{allp}',true)">全选</button>
+<button class="btn sm gray" onclick="pickAll('{allp}',false)">取消全选</button>
+<button class="btn sm" onclick="backup('{allp}','all')">📦 整体备份全部玩家</button>
+<button class="btn sm red" onclick="del('{allp}')">🗑 备份后删除勾选</button></div>
+{pl_html}</div>"""
+
+    content = f"""
+<div class="banner warn block"><b class="t">📦 备份 / 删除存档前, 先看这几句</b>
+<p>Unturned 的存档文件是<b class="hl">加密的</b>, 人工打不开也改不了 —— 所以下面只写明每个文件是什么,
+你按名字勾选就够了。</p>
+<p><b class="hl">建筑存档</b>在 <code class="k">Level\\地图名\\</code>；
+<b class="hl">玩家存档</b>在 <code class="k">Players\\SteamID_0\\</code>。
+路径全部按你在「切换/重设」里选的游戏目录 + 当前存档自动读取。</p>
+<p>带 ♻ 说明的是游戏自己留的<b class="hl">上一次保存的旧版本</b>文件, 一般跟着一起备份即可。</p>
+<p>删除操作<b class="hl">一定会先备份</b>: 先把你勾选的内容复制到你指定的位置, 备份成功后才开始删;
+只要备份有一丁点失败, 就一个文件都不会动。</p>
+<p>删除只删勾选到的<b class="hl">那几个文件</b>, 不会删 Level / Players 这些文件夹,
+空文件夹会原样保留, 下次开服正常使用。</p>
+<p>请<b class="hl">先关服</b>再删存档 —— 服务器运行中删掉的文件, 会在关服自动保存时被重新写回去。</p></div>
+
+<div class="card"><h2>① 备份要保存在哪里 (自己选)</h2>
+<div class="desc">选一个文件夹就行, 桌面、其他盘、移动硬盘都可以。每次备份都会在里面新建一个
+「{esc(instance())}_备份_年月日_时分秒」子文件夹, 文件夹内部保持 Level / Players 的原目录结构, 不会覆盖你上一次的备份。</div>
+<div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+<input class="f" id="dest" style="flex:1;min-width:300px" placeholder="例如 D:\\我的存档备份"
+ value="{esc(suggested)}">
+<button class="btn gray" onclick="browse()">📂 浏览文件夹…</button></div>
+<div class="hint" id="lastbk"></div></div>
+
+<div class="card"><h2>② 建筑存档 · Level</h2>
+<div class="desc">玩家搭的房子、地基、墙、门、箱子、停着的车等<b>地图上的东西</b>。删掉 = 这些建筑从地图上消失。</div>
+<div class="hint" style="margin-bottom:8px">当前位置: <code class="k">{esc(os.path.join(sd, 'Level'))}</code></div>
+{lv_html}</div>
+
+<div class="card"><h2>③ 玩家存档 · Players</h2>
+<div class="desc">每个文件夹是一个玩家, 文件夹名就是他的 <b>SteamID64</b> (17 位数字)。
+物品栏、技能、血量、任务、穿着都在里面。删掉 = 该玩家从零开始重新玩。</div>
+<div class="hint" style="margin-bottom:8px">当前位置: <code class="k">{esc(os.path.join(sd, 'Players'))}</code>
+ · 想知道哪个 ID 是谁: 开服后在「控制台 → 在线玩家」里对照即可</div>
+{pl_html}</div>
+"""
+    script = """
+function destPath(){var d=document.getElementById('dest'),v=d.value.trim();
+ if(!v){toast('请先选择备份保存在哪个文件夹',1);d.focus();}
+ return v;}
+function boxes(g){return [].slice.call(document.querySelectorAll('#'+g+' input.bx'));}
+function pickAll(g,ck){boxes(g).forEach(function(b){b.checked=ck;});}
+function picked(g){return boxes(g).filter(function(b){return b.checked}).map(function(b){return b.value});}
+function allFiles(g){return boxes(g).map(function(b){return b.value});}
+function setLast(p){if(p)document.getElementById('lastbk').textContent='📁 最近一次备份位置: '+p;}
+async function backup(g,mode){
+ var items=mode==='all'?allFiles(g):picked(g);
+ if(!items.length){toast('先勾选要备份的存档文件',1);return;}
+ var d=destPath();if(!d)return;
+ toast('正在备份 '+items.length+' 个存档文件…');
+ var r=await post('/api/saves/backup',{items:items,dest:d});
+ toast(r.msg,r.ok?0:1);if(r.ok)setLast(r.dest);}
+async function del(g){
+ var items=picked(g);
+ if(!items.length){toast('先勾选要删除的存档文件 (删除必须先勾选)',1);return;}
+ var d=destPath();if(!d)return;
+ var go=await modal({icon:'🗑',title:'删除前会先自动备份',
+  body:'第 1 步: 把你勾选的 '+items.length+' 个存档文件完整备份到\\n'+d+
+       '\\n第 2 步: 备份确认成功后, 才删除这些文件本身。\\n'+
+       'Level / Players 等文件夹会保留, 只删对应的文件。\\n备份失败则不会删除任何东西。\\n\\n确定继续吗?',
+  okText:'先备份, 再删除',noText:'取消',danger:true});
+ if(!go)return;
+ toast('正在备份并删除…');
+ var r=await post('/api/saves/delete',{items:items,dest:d,confirm:true});
+ toast(r.msg,r.ok?0:1);
+ if(r.ok){pickAll(g,false);setLast(r.dest);setTimeout(function(){location.reload();},2600);}}
+function browse(){
+ var m=document.createElement('div');m.className='mask';
+ var box=document.createElement('div');box.className='modal-box wide';
+ var h=document.createElement('h3');h.textContent='📂 选择备份保存的文件夹';
+ var path=document.createElement('div');path.className='dpath';
+ var list=document.createElement('div');list.className='dirlist';
+ var bt=document.createElement('div');bt.className='mbtns';
+ function btn(t,cls){var b=document.createElement('button');b.className=cls;b.textContent=t;
+  bt.appendChild(b);return b;}
+ var up=btn('⬆ 上一级','btn gray'),no=btn('取消','btn gray'),ok=btn('✔ 保存在这里','btn');
+ box.appendChild(h);box.appendChild(path);box.appendChild(list);box.appendChild(bt);
+ m.appendChild(box);document.body.appendChild(m);
+ var st={cwd:'',parent:''};
+ function show(p){
+  list.textContent='加载中…';
+  post('/api/dirs',{path:p}).then(function(d){
+   list.textContent='';
+   if(!d.ok){list.textContent=d.msg||'打不开该文件夹';return;}
+   st={cwd:d.cwd,parent:d.parent};
+   path.textContent=d.cwd?('当前文件夹: '+d.cwd):'先选一个盘:';
+   if(!d.dirs.length){list.textContent='这个里面没有子文件夹 —— 右边点「✔ 保存在这里」即可选它。';return;}
+   d.dirs.forEach(function(x){
+    var b=document.createElement('button');b.className='ditem';b.textContent='📁 '+x.name;
+    b.onclick=function(){show(x.path);};list.appendChild(b);});});}
+ up.onclick=function(){show(st.parent||'');};
+ no.onclick=function(){m.remove();};
+ ok.onclick=function(){
+  if(!st.cwd){toast('先进入一个文件夹再确定',1);return;}
+  document.getElementById('dest').value=st.cwd;m.remove();};
+ m.addEventListener('click',function(e){if(e.target===m)m.remove();});
+ show('');}
+"""
+    return shell("save", "存档管理", content, script)
 
 
 # ================================================================ 控制台
 def page_console():
     content = f"""
 <div class="card"><h2>在线玩家</h2>
-<div class="desc">点「刷新玩家列表」获取在线玩家。给物品/车辆/无敌/隐身/传送属于作弊指令, 需要服务器开启 Cheats。</div>
+<div class="desc">点「刷新玩家列表」获取在线玩家 (会显示玩家名 + SteamID)。给物品/给车辆/传送/踢出属于作弊指令, 需要服务器开启作弊 (Commands.dat 里的 <code class="k">cheats on</code>)。<br>
+按钮会自动用 <b>SteamID</b> 定位玩家, 中文玩家名也不会匹配失败。<br>
+<b>无敌和隐身</b>需玩家自己在游戏内使用指令: <code class="k">/god</code> 开无敌、<code class="k">/vanish</code> 开隐身 (开服器不提供按钮)。</div>
 <div style="display:flex;gap:10px;margin:10px 0;flex-wrap:wrap">
 <button class="btn" onclick="refreshPlayers()">刷新玩家列表</button>
 <span class="hint" id="pcount" style="align-self:center"></span></div>
-<div id="plist" class="hint">尚未获取。获取后可对玩家执行: 给物品 / 给车辆 / 无敌 / 隐身 / 传送到其他玩家身边 / 踢出</div>
+<div id="plist" class="hint">尚未获取。获取后可对玩家执行: 给物品 / 给车辆 / 传送到其他玩家身边 / 踢出</div>
 </div>
 <div class="card"><h2>快捷指令</h2>
 <div class="desc">一键发送常用服务器指令 (原版/ Rocket 通用)。</div>
@@ -2097,13 +3773,19 @@ def page_console():
 <button class="btn" onclick="send()">发送</button>
 </div></div>
 <div class="card"><h2>运行日志
-<label class="container" style="margin-left:14px">{torch_html(ident="f_err")}<span class="lbl">只看报错/警告</span></label>
+{check_html(ident="f_err", label="只看报错/警告", style="margin-left:14px")}
 </h2>
 <div class="term" id="term"></div>
 <div class="hint" id="logsrc"></div>
 <div class="hint">实时滚动 · <span style="color:#fca5a5">红色</span>=报错
 <span style="color:#fde047">黄色</span>=警告 <span style="color:#6ee7b7">绿色</span>=服务器代码 · 来自 Rocket 日志;
-刚装完 Rocket 或刚开服时日志需要等服务器完全启动后才会出现, 服务器自己的黑色控制台窗口里始终有实时输出</div></div>
+刚装完 Rocket 或刚开服时日志需要等服务器完全启动后才会出现, 服务器自己的黑色控制台窗口里始终有实时输出</div>
+<div class="banner info block" style="margin-top:10px">
+<b class="t">ℹ️ 启动服务器时出现报错和警告属于正常行为</b>
+<p>Unturned 服务端启动阶段本身会打印一些红字/黄字信息, 只要服务器能正常开服、朋友能进服就没有影响。</p>
+<p><b class="hl">如果没有安装其他插件(Rocket 插件/模组), 不用管这些报错和警告</b>。</p>
+<p>只有当服务器起不来、地图加载卡住或插件明显不生效时, 再针对性排查对应的日志行。</p></div>
+</div>
 """
     script = r"""
 var lastIdx=0,auto=true;
@@ -2158,13 +3840,11 @@ function renderPlayers(players,raw){
   mk('给车辆',()=>{var id=prompt('给「'+p.name+'」哪个载具ID?');if(!id)return;
     var cmd='vehicle '+target+' '+id.trim();
     post('/api/console',{cmd:cmd}).then(r=>toast(r.ok?'已发送: '+cmd:r.msg,r.ok?0:1));});
-  mk('无敌',()=>post('/api/console',{cmd:'god '+target}).then(r=>toast(r.ok?'已发送: god '+target:r.msg,r.ok?0:1)));
-  mk('隐身',()=>post('/api/console',{cmd:'vanish '+target}).then(r=>toast(r.ok?'已发送: vanish '+target:r.msg,r.ok?0:1)));
   mk('传送到…',()=>{var dst=prompt('把「'+p.name+'」传送到哪位玩家身边?');if(!dst)return;
     var cmd='teleport '+target+' '+dst.trim();
     post('/api/console',{cmd:cmd}).then(r=>toast(r.ok?'已发送: '+cmd:r.msg,r.ok?0:1));});
   mk('踢出',()=>{var rs=prompt('踢出「'+p.name+'」的原因(可空):');if(rs===null)return;
-    var cmd='kick '+p.name+(rs.trim()?' '+rs.trim():'');
+    var cmd='kick '+target+(rs.trim()?' '+rs.trim():'');
     post('/api/console',{cmd:cmd}).then(r=>toast(r.ok?'已发送: '+cmd:r.msg,r.ok?0:1));});
   box.appendChild(row);});
 }
@@ -2177,22 +3857,57 @@ poll();setInterval(poll,1500);
 # ================================================================ 帮助页
 def page_help():
     content = """
+<div class="card sos"><h2><span class="sostag">置顶</span>🚨 进不去服务器? 对着报错一条条解决</h2>
+<div class="desc">你或朋友用服务器代码连接失败时, 游戏会在屏幕上弹一句提示。下面四条覆盖了日常遇到的
+绝大多数情况, <b>先看清提示是哪一条, 再照着做</b>, 不用一头雾水地乱重启。</div>
+
+<div class="sosrow"><b>① 服务器连接超时 / 连接失败</b>
+<div class="fix">一般是<b>本机网络</b>的问题, 不是服务器坏了。让进不去的那个人<b>连着试两次</b>;
+两次都进不来, 就把<b>服务器重启一次</b>, 再把仪表盘最新的那串代码发给他。</div></div>
+
+<div class="sosrow"><b>② 无法验证 Steam 经济 / 连接 Steam 服务器失败</b>
+<div class="fix">这条<b>最常见</b>, 十个人里八个会撞到 —— 它跟你的服务器没半点关系, 是 Steam 那边一时
+没连通。<b>不用重启服务器</b>, 直接<b>硬挤</b>: 反复点连接多试几次, 只要有一次跟 Steam 服务器通上就进来了。
+<b>特别注意: 开了加速器反而更容易一直跳这一句</b>, 解决办法还是硬挤, 或者重启服务器。</div></div>
+
+<div class="sosrow"><b>③ 未开启 BattlEye (战眼反作弊)</b>
+<div class="fix">两条路选一条:<br>
+① 在开服器「玩法设置」页 → 网络/安全 → 把 <code class="k">BattlEye 反作弊</code> 设为<b>关闭</b>,
+保存后重启服务器;<br>
+② 给<b>游戏本体</b>(不是服务器)重装战眼: Steam 库里右键 Unturned → 管理 → 浏览本地文件 →
+进 <code class="k">BattlEye</code> 文件夹运行 <code class="k">Install_BattlEye.bat</code>,
+装完重启电脑再进服。</div></div>
+
+<div class="sosrow"><b>④ 其他没写到的报错</b>
+<div class="fix">绝大多数<b>重启服务器</b>就能解决。只有两种重启没用: <b>模组冲突</b>(开服卡住、闪退、
+进不去, 见「创意工坊」页顶部的风险提示)和<b>插件冲突</b>, 这两种要一个个卸载排查。<br>
+<b>联机模式请不要使用来路不明的插件</b> —— 它们可能带病毒, 也可能直接把存档搞坏,
+到时候丢的是所有人的建筑和进度。</div></div>
+
+<div class="sosqq">遇到上面四条都没覆盖的特殊问题, 加开发者 QQ <b>2497194220</b> 私聊问询。
+<b>添加好友时请把问题一并写明</b>(报的是哪句错、从什么时候开始、是服务器进不去还是客户端崩了),
+我看到了都会回复。</div>
+</div>
+
 <div class="card"><h2>第一次开服 (3 步)</h2>
 <div class="desc" style="line-height:2.1">
 1. 首次打开会进入「初始设置」: 选游戏目录 → 选存档(或取名新建)<br>
-2. 回到<b>仪表盘</b>点「开服」, 等 30~60 秒, 中间出现一串数字 = <b>服务器代码</b><br>
+2. 回到<b>仪表盘</b>点「开服」, 等 30~60 秒 (地图<b>加载到 100%</b> 后), 中间出现一串数字 = <b>服务器代码</b><br>
 3. 点「复制服务器代码」发给朋友 → 朋友游戏内 <b>Play → 输入服务器代码</b> 即可联机 (无需端口映射)<br>
-<span class="hint">注意: 服务器代码每次开服都会变化, 以最新的为准。朋友输入代码无反应/报错时, 先确认你这边服务器显示"运行中", 再让朋友重启 Steam 后重试。</span>
+<span class="hint">注意: 服务器代码每次开服都会变化, 以最新的为准。开服器会<b>严格等到地图加载到 100%</b> 才显示代码,
+所以刚开服时先看到"服务器正在启动"是正常现象, 不会把上一局的旧代码显示出来。
+朋友输入代码无反应/报错时, 先确认你这边服务器显示"运行中", 再让朋友重启 Steam 后重试。</span>
 </div></div>
 
 <div class="card"><h2>每个菜单是干什么的</h2>
 <div class="desc" style="line-height:2.1">
 <b>仪表盘</b> — 开服 / 重启 / 关服, 查看服务器代码和基本信息<br>
-<b>一键设置</b> — 最常用的傻瓜开关: 死亡不掉落、建筑无敌、车辆无敌、僵尸不拆家、摔落伤害、组队友伤、空投、出生满技能; 僵尸强度 / 经验倍率 / 物资丰富度 / 天气<br>
-<b>服务器设置</b> — 服务器名称、地图、人数、端口、PVP/PVE、难度、视角、进服密码; 以及<b>启动参数</b>和 <b>Rocket 安装</b><br>
+<b>一键设置</b> — 最常用的傻瓜开关: 死亡不掉落、建筑无敌、车辆无敌、僵尸不拆家、摔落伤害、组队友伤、空投、出生满技能、<b>无需指南针/GPS/手绘地图也能看方向和地图</b>; 僵尸强度 / 经验倍率 / 物资丰富度 / 天气; 还有 <b>Rocket 指令反馈汉化</b><br>
+<b>服务器设置</b> — 服务器名称、地图、人数、端口、PVP/PVE、难度、视角、进服密码、<b>开启作弊 (cheats on)</b>; 以及<b>启动参数</b>、<b>Rocket 安装</b>, 页面最底下是 <b>服务器图标与大厅链接 (图床设置)</b><br>
 <b>玩法设置</b> — 进阶参数: 血量、经验、刷怪、刷车、建筑承伤、空投频率、天气等 (每项都有中文说明)<br>
 <b>创意工坊</b> — 填模组 ID 自动下载 Steam 创意工坊模组<br>
-<b>控制台</b> — 实时日志和报错、发送命令、<b>在线玩家管理</b> (给物品/车辆、无敌、隐身、传送、踢出)、白天/黑夜等快捷指令<br>
+<b>存档管理</b> — <b>建筑存档 / 玩家存档</b>的备份与删除 (删除前强制先备份, 位置自己选)<br>
+<b>控制台</b> — 实时日志和报错、发送命令、<b>在线玩家管理</b> (给物品/车辆、传送、踢出；无敌/隐身由玩家自行使用 /god 与 /vanish 指令)、白天/黑夜等快捷指令<br>
 <b>操作日志</b> — 记录你在网页里的每次操作和错误, 出问题先来这里看<br>
 <b>文件管理</b> — 直接编辑所有配置文件 (含 Rocket 插件配置)
 </div></div>
@@ -2221,20 +3936,92 @@ def page_help():
 · 控制台里输入 <code class="k">rocket reload</code> 可以重载插件
 </div></div>
 
+<div class="card"><h2>存档备份 / 删除 (存档管理页)</h2>
+<div class="desc" style="line-height:2.1">
+· 存档文件是<b>加密的</b>, 人工打不开 —— 这一页只告诉你每个文件是什么, 你按名字勾选即可<br>
+· <b>建筑存档</b> = <code class="k">Servers\\存档名\\Level\\地图名\\</code>: 房子、地基墙门、场景物件、停着的车、光照等<br>
+· <b>玩家存档</b> = <code class="k">Servers\\存档名\\Players\\SteamID_0\\</code>: 物品栏、技能、血量、任务、穿着等<br>
+· 备份位置<b>完全由你自己选</b> (点「📂 浏览文件夹」挑一个), 每次备份新建
+<code class="k">存档名_备份_年月日_时分秒</code> 子文件夹, 不覆盖上次备份<br>
+· 可以<b>整体备份</b>一个地图 / 一个玩家 / 全部玩家, 也可以只勾几个文件<b>单个备份</b><br>
+· 文件名带 <code class="k">~</code> 的是游戏自己留的<b>上一次保存的旧版本</b><br>
+· <b>删除一定会先备份</b>: 备份成功后才删, 备份失败则一个文件都不动;<br>
+　　　　删除只删你勾选的那几个文件, <b>不会删除 Level / Players 文件夹</b>, 空文件夹原样保留<br>
+· 删档前请<b>先关服</b> —— 服务器运行中删掉的文件会在关服自动保存时写回去
+</div></div>
+
+<div class="card"><h2>Rocket 指令反馈汉化 (一键设置页)</h2>
+<div class="desc" style="line-height:2.1">
+· 这个开关<b>不是汉化控制台</b>, 服务器日志 / 控制台输出完全不受影响<br>
+· 它只汉化<b>玩家或管理员敲完指令之后 Rocket 回的那句话</b>: 例如 /tp、/give、/god 的提示,
+玩家进服、权限不足、插件加载完成等反馈 (共 95 条)<br>
+· 开启 = 覆盖 <code class="k">Servers\\存档名\\Rocket\\</code> 里的
+<code class="k">Rocket.en.translation.xml</code> 与 <code class="k">Rocket.Unturned.en.translation.xml</code>;<br>
+· 关掉开关会<b>逐字节还原</b>成英文原文; 改完重启服务器生效<br>
+· 存档里还没有这两个文件时开不了 —— 先装 Rocket 前置插件并开一次服, Rocket 会自动生成
+</div></div>
+
+<div class="card"><h2>不用道具也能看方向和地图 (一键设置页)</h2>
+<div class="desc" style="line-height:2.1">
+· <b>无需指南针即可显示方向</b> — 玩家不用捡指南针, 屏幕上一直显示朝向 (北/东/南/西)<br>
+· <b>无需GPS即可开启卫星地图</b> — 不用捡 GPS 物品也能打开卫星地图看全图<br>
+· <b>无需手绘地图即可开启手绘地图</b> — 不用捡纸质/手绘地图也能打开手绘地图<br>
+· 对应 <code class="k">Config.txt</code> 的 <code class="k">Gameplay</code> 段
+<code class="k">Compass</code> / <code class="k">Satellite</code> / <code class="k">Chart</code>,
+关掉开关即恢复游戏默认 (想更细地调可以去「玩法设置」页, 同一批参数也在那里)<br>
+· 改完重启服务器生效
+</div></div>
+
+<div class="card"><h2>服务器图标与大厅链接 (服务器设置页 · 最底下的图床设置)</h2>
+<div class="desc" style="line-height:2.1">
+· 写在 <code class="k">Config.txt</code> 的 <code class="k">Browser</code> 段:
+<code class="k">Icon</code> = 玩家进服大厅左上角图标 (建议 64x64),
+<code class="k">Thumbnail</code> = 服务器列表小图 (建议 32x32),
+<code class="k">Links</code> = 大厅里玩家能点的按钮<br>
+· <b>新建存档会自动填入 Dawn Sharkk 默认图标和 GitHub 链接</b>; 已有存档第一次打开「服务器设置」时也会自动补齐一次,
+之后你自己改过或清掉的值不会再被覆盖<br>
+· 图片必须是能直接访问的<b>图片直链</b> (以 .jpg / .png 结尾的图床地址), 由玩家客户端自行下载;
+留空 = 不显示图标<br>
+· 链接每行一条, 格式 <code class="k">显示文字 | 网址</code>, 最多 8 条<br>
+· 改完重启服务器生效; 想直接看原文可在「文件管理」打开 Config.txt 的 Browser 段
+</div></div>
+
 <div class="card"><h2>控制台玩家管理</h2>
 <div class="desc" style="line-height:2.1">
-「刷新玩家列表」后可对每位玩家: <b>给物品</b>(give) / <b>给车辆</b>(vehicle) / <b>无敌</b>(god, 再点一次取消) /
-<b>隐身</b>(vanish, 再点一次取消) / <b>传送到其他玩家身边</b>(teleport) / <b>踢出</b>(kick)<br>
+「刷新玩家列表」后可对每位玩家: <b>给物品</b>(give) / <b>给车辆</b>(vehicle) / <b>传送到其他玩家身边</b>(teleport) / <b>踢出</b>(kick)<br>
 物品和载具 ID 可在游戏内按物品分类查询, 或搜索 "Unturned Item ID"<br>
-<span class="hint">这些属于作弊指令, 需要服务器开启 Cheats (本工具新建的存档默认已开启; 也可在 Commands.dat 里加一行 Cheats)。
-给物品/车辆也可以直接用玩家名或 SteamID 写在命令里。</span>
+<span class="hint">这些属于作弊指令, 需要服务器开启作弊 (本工具新建的存档默认已在 Commands.dat 写入 <code class="k">cheats on</code>; 也可在「服务器设置」页勾选开启)。
+按钮会自动用玩家的 <b>SteamID</b> 定位玩家, 名字里有中文或空格也不怕匹配失败。<br>
+<b>无敌 / 隐身</b>开服器不提供按钮, 需玩家自己在游戏内输入指令: <code class="k">/god</code> (无敌) 和 <code class="k">/vanish</code> (隐身), 再输入一次取消。</span>
 </div></div>
 
 <div class="card"><h2>常见问题</h2>
 <div class="desc" style="line-height:2.1">
 <b>改了配置没生效?</b> 配置修改后必须<b>重启服务器</b>; 而且改之前先关服, 否则服务器退出时会把旧配置写回去<br>
-<b>朋友用代码进不来?</b> ① 确认代码是最新一次开服的 ② 双方重启 Steam 再试 ③ 出现 "Lost connection" 多为网络中转问题, 换直连 IP 方式: 同一网络用 仪表盘显示的 局域网IP:端口, 远程朋友则需要路由器端口映射(端口见服务器设置)或内网穿透<br>
+<b>朋友用代码进不来?</b> ① 确认代码是<b>最新一次开服</b>的 (每次开服都会变) ② 双方重启 Steam 再试 ③ 出现 "Lost connection" 多为 Steam P2P 网络中转问题, 让对方隔几分钟重试代码联机<br>
+<b>能用 IP+端口 连吗?</b> 不能 —— Unturned 的这种 P2P 服没有局域网/公网 IP 直连方式, IP 直连只适用于<b>官方服务器</b>(需在 Config.txt 填 Steam 官方 <code class="k">Login_Token</code>), 本工具基于方便快捷不做这条路<br>
 <b>怎么安全关服?</b> 点「关服」或控制台输入 <code class="k">shutdown</code>, 都会自动保存世界; 强制结束进程才会丢档<br>
+<b>存档删错了怎么办?</b> 「存档管理」的删除一定会先把删掉的文件备份到你选的位置 —— 关服状态下把备份文件夹里的
+<code class="k">Level</code> / <code class="k">Players</code> 对应文件复制回存档目录即可恢复<br>
+<b>服务器图标/链接不显示?</b> ① 地址必须是 <code class="k">http(s)://</code> 开头的<b>图片直链</b>
+(网页浏览地址、带 ? 参数的分享链接都不行) ② 改完要<b>重启服务器</b> ③ 图标由玩家客户端下载,
+玩家网络访问不了该图床就看不到<br>
+<b>服务器代码一直显示"正在启动"?</b> 正常现象 —— 开服器<b>严格要求地图加载到 100%</b> 才显示代码,
+每次开服(含重启)都是全新代码, 绝不会把上一局的代码拿来顶上; 等十几秒点右上角「↻ 刷新」即可<br>
+<b>给物品/踢出提示找不到玩家?</b> 玩家名里有中文或空格时游戏按名字匹配会失败 ——
+「刷新玩家列表」后点按钮, 开服器会自动改用该玩家的 <b>SteamID</b> 定位, 一般不会再失败;
+手工敲命令时把名字换成那一串 17 位 SteamID 即可<br>
+<b>玩家老是迷路?</b> 打开「一键设置」里的 <b>无需指南针即可显示方向</b> +
+<b>无需GPS即可开启卫星地图</b>, 不用捡道具也能看方向和全图<br>
+<b>选了别的地图却还是 PEI?</b> 「服务器设置」页的下拉框现在会<b>真正写入</b> <code class="k">Map 地图名</code>
+(旧版本只认手动输入框, 所以下拉框选了没反应)。保存后本页会显示真实地图名; 地图名探测不到时
+<b>开服会给黄字警告</b>, 不会再一声不响地退回 PEI。创意工坊地图要先在「创意工坊」页订阅才会下载。
+另外<b>换地图等于换一张全新的世界</b>, 老地图的建筑仍然存在 <code class="k">Level\\旧地图名</code> 里, 名字改回去就能看到<br>
+<b>设置改了没保存, 切个页面就白改了?</b> 「服务器设置」和「玩法设置」已经加了防呆, 不用再担心保存按钮藏得深:
+只要有改动没保存, 右下角会一直挂着「⚠ 有 N 处修改还没保存」, 改过的卡片描上黄边;
+这时候点侧边栏换页、点「▶ 开服 / 🔄 重启」、甚至刷新网页, 都会先弹窗问你要怎么办 ——
+<b>💾 先保存再继续</b> (替你按下各块的保存按钮再走) / <b>🗑 取消更改</b> (把页面恢复成保存前的样子再走) /
+<b>留在本页</b> (什么都不动)。点右下角的提示条还能直接跳到没保存的那一块。<b>最多点一次保存, 配置不会白改</b><br>
 <b>网页报错?</b> 打开「操作日志」看红色错误行, 把它截图反馈
 </div></div>
 """
@@ -2255,7 +4042,7 @@ def page_logs():
 <label><input type="radio" name="logcat" value="错误" onchange="load()"><span>错误</span></label>
 </div>
 <span style="flex:1"></span>
-<label class="container">{torch_html(True, ident="autoref")}<span class="lbl">自动刷新</span></label>
+{check_html(True, ident="autoref", label="自动刷新")}
 <button class="btn sm gray" onclick="load()">刷新</button>
 <button class="btn sm red" onclick="clearLog()">🗑 清空日志</button>
 </div></div>
@@ -2367,13 +4154,15 @@ border-radius:8px;padding:8px 12px;font-size:12px;margin-top:14px;line-height:1.
 {THEME_SWITCH}
 <div class="login">
 <img class="logo-img" src="/logo.png" style="width:84px;height:84px" alt="logo">
-<h2 style="margin-top:12px">Dawn Sharkk</h2><div class="desc">Unturned 开服器 · by Pippl</div>
-<div class="desc">请输入<b>登录密钥</b>进入管理页面</div>
+<h2 style="margin-top:12px">Dawn Sharkk</h2><div class="desc">Unturned 开服器 v{VERSION} · by Pippl</div>
+<div class="desc" id="tip">正在通过网址密钥自动登录…</div>
+<div id="box" style="display:none">
 <input class="f" id="pw" placeholder="粘贴或输入密钥" maxlength="32"
  onkeydown="if(event.key==='Enter')doLogin()" autofocus>
 <button class="btn" onclick="doLogin()">登 录</button>
-<div class="keyhint">密钥在启动开服器.bat 的黑色命令框里 (已自动复制到剪贴板, 直接 Ctrl+V)<br>
-注意: 密钥每次启动开服器都会变化, 以命令框里显示的最新密钥为准</div>
+<div class="keyhint">密钥在启动开服器.bat 的黑色命令框里 (命令框里那行<b>完整网址</b>已自动复制到剪贴板, 直接 Ctrl+V 到地址栏即可自动登录)<br>
+注意: 网址自动登录只在开服器启动后 <b>30 分钟</b>内有效, 超时请手动输入密钥; 密钥每次启动开服器都会变化</div>
+</div>
 </div>
 <script>
 try{{var t0=new URLSearchParams(location.search).get('theme')||localStorage.getItem('untheme');
@@ -2386,13 +4175,24 @@ h.classList.toggle('light',!cb.checked);
 localStorage.setItem('untheme',cb.checked?'dark':'light');}}
 function toast(m,err){{var d=document.createElement('div');d.className='tmsg'+(err?' err':'');
 d.textContent=m;document.getElementById('toast').appendChild(d);setTimeout(()=>d.remove(),3000);}}
+async function submit(pw,via){{
+ try{{var r=await fetch('/api/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+  body:JSON.stringify({{password:pw,via:via}})}});
+ if(r.status===200){{location.href='/';return true;}}
+ return await r.json();}}catch(e){{return {{msg:'网络异常, 请重试'}};}}}}
+function showBox(msg,err){{document.getElementById('box').style.display='';
+ document.getElementById('tip').innerHTML=msg?'<b>需要输入登录密钥</b>':'请输入<b>登录密钥</b>进入管理页面';
+ if(msg)toast(msg,err===undefined?1:err);
+ var p=document.getElementById('pw');if(p)p.focus();}}
 async function doLogin(){{
  var pw=document.getElementById('pw').value.trim();
  if(!pw){{toast('请输入密钥',1);return;}}
- var r=await fetch('/api/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-  body:JSON.stringify({{password:pw}})}});
- if(r.status===200){{location.href='/';return;}}
- toast('密钥不对, 请查看命令框里的登录密钥',1);}}
+ var r=await submit(pw,'manual');
+ if(r!==true)toast((r&&r.msg)||'密钥不对, 请查看命令框里的登录密钥',1);}}
+var q=new URLSearchParams(location.search), k=q.get('key');
+if(k){{try{{history.replaceState({{}},'',location.pathname);}}catch(e){{}}
+ submit(k,'url').then(function(r){{if(r!==true)showBox((r&&r.msg)||'自动登录失败, 请手动输入密钥');}});}}
+else showBox('');
 syncSwitch();
 </script></body></html>"""
 
@@ -2453,6 +4253,7 @@ def page_setup():
 if(t==='light')document.documentElement.classList.add('light');
 if(t)localStorage.setItem('untheme',t);}}catch(e){{}}</script>
 <style>{CSS}{SETUP_CSS}</style></head><body>
+<div id="toast"></div>
 {THEME_SWITCH}
 <div class="wiz">
 <div class="logo"><img class="logo-img" src="/logo.png" style="width:72px;height:72px" alt="logo">
@@ -2508,7 +4309,14 @@ async function chooseInst(){{
   if(sel.value==='__new__'&&!name){{toast2('先给新存档起个名字 (英文/数字)',1);
    document.getElementById('newname').focus();return;}}
   var r=await post('/api/setup/instance',{{name:name}});
-  if(r&&r.ok){{location.href='/';return;}}
+  if(r&&r.ok){{
+   if(sel.value==='__new__'&&r.rocket&&!r.rocket.installed){{
+    var go=await rocketChoice('服务器存档创建成功 🎉',
+     '未检测到 Rocket 前置插件。如需使用更多功能请开启 Rocket 前置插件 '+
+     '(加载 .dll 插件、RCON 指令、玩家管理等)。将运行游戏自带 Extras 里的 Install Rocket.bat 安装; '+
+     '点「忽略」直接进入开服器, 之后在「服务器设置」页随时可以开启。');
+    if(go)await doRocketInstall();}}
+   location.href='/';return;}}
   toast2((r&&r.msg)||'操作失败, 请重试',1);
  }}catch(e){{toast2('请求失败: '+e+' (开服器窗口还开着吗?)',1);}}
  finally{{btn.disabled=false;}}}}
@@ -2528,9 +4336,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _json(self, obj):
+    def _json(self, obj, code=200):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
+        self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -2612,16 +4420,19 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             if u.path.startswith("/api/"):
                 return self._unauth_json()
-            return self._redirect("/login")
+            key = (parse_qs(u.query).get("key") or [""])[0]
+            return self._redirect("/login" + (f"?key={quote(key, safe='')}" if key else ""))
         if u.path == "/api/status":
             _push_log_tails()   # 仪表盘轮询时同步日志, 确保 Server Code 及时被抓取
             running, pid = server_running()
             info = cmd_info()
             return self._json({
-                "running": running, "pid": pid, "ip": lan_ip(), "port": info["port"],
+                "running": running, "pid": pid, "port": info["port"],
                 "name": info["name"], "map": info["map"], "mode": info["mode"],
-                "code": _server_code[0],
+                "code": _server_code[0] if running else None,
                 "setup": setup_done(),
+                "rocket": rocket_status(), "cheat": cheat_enabled(),
+                "maxplayers": info["maxplayers"],
                 "instance": instance(), "game_dir": game_dir()})
         if u.path == "/setup":
             return self._html(page_setup())
@@ -2637,6 +4448,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._html(page_gameplay())
         if u.path == "/workshop":
             return self._html(page_workshop())
+        if u.path == "/saves":
+            return self._html(page_saves())
         if u.path == "/console":
             return self._html(page_console())
         if u.path == "/logs":
@@ -2674,6 +4487,11 @@ class Handler(BaseHTTPRequestHandler):
             import hmac as _hmac
             raw_pw = body.get("password")
             pw = raw_pw.strip() if isinstance(raw_pw, str) else ""
+            auto = body.get("via") == "url"          # 网址 ?key= 自动登录
+            if auto and pw and not key_auto_ok():
+                oplog("安全", "自动登录已过期(超过 30 分钟), 需手动输入密钥")
+                return self._json({"ok": False, "expired": True,
+                                   "msg": "自动登录已超过 30 分钟, 请手动输入密钥"}, 401)
             if pw and _hmac.compare_digest(pw.encode("utf-8"), login_key().encode("utf-8")):
                 token = "".join(random.choices(string.ascii_letters + string.digits, k=32))
                 _settings["session"] = token
@@ -2736,7 +4554,9 @@ class Handler(BaseHTTPRequestHandler):
             _settings["instance"] = name
             save_settings()
             oplog("操作", f"{'创建' if created else '切换'}存档: {name}")
-            return self._json({"ok": True, "msg": f"已选择存档「{name}」"})
+            return self._json({"ok": True, "created": created,
+                               "rocket": rocket_status(),
+                               "msg": f"已选择存档「{name}」"})
 
         if not setup_done():
             return self._json({"ok": False, "msg": "请先完成初始设置"})
@@ -2810,6 +4630,45 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as e:
                 return self._json({"ok": False, "msg": str(e)})
 
+        if u.path == "/api/rocketzh":
+            ok, msg = set_rocket_zh(bool(body.get("on")))
+            return self._json({"ok": ok, "msg": msg})
+
+        if u.path == "/api/browser":
+            icon = str(body.get("icon", "")).strip()[:300]
+            thumb = str(body.get("thumb", "")).strip()[:300]
+            links = parse_link_lines(str(body.get("links", ""))[:2000])
+            for label, val in (("图标 Icon", icon), ("缩略图 Thumbnail", thumb)):
+                if val and not val.startswith(("http://", "https://")):
+                    return self._json({"ok": False,
+                                       "msg": f"{label} 必须是 http:// 或 https:// 开头的图片直链"})
+            try:
+                set_browser_cfg(icon, thumb, links)
+            except OSError as e:
+                oplog("错误", f"保存服务器图标失败: {e}")
+                return self._json({"ok": False, "msg": str(e)})
+            oplog("操作", f"服务器图标/链接: Icon={icon or '(清空)'} "
+                          f"Thumbnail={thumb or '(清空)'} 链接 {len(links)} 条")
+            return self._json({"ok": True, "links": len(links),
+                               "msg": f"已写入 Config.txt 的 Browser 段 "
+                                      f"(图标 {'已设置' if icon else '已清空'}, 链接 {len(links)} 条), "
+                                      f"重启服务器后玩家端生效"})
+
+        if u.path == "/api/saves/backup":
+            items = [str(x)[:400] for x in body.get("items", [])][:600]
+            ok, msg, target = backup_saves(items, str(body.get("dest", ""))[:500])
+            return self._json({"ok": ok, "msg": msg, "dest": target})
+
+        if u.path == "/api/saves/delete":
+            items = [str(x)[:400] for x in body.get("items", [])][:600]
+            if not body.get("confirm"):
+                return self._json({"ok": False, "msg": "请先在确认弹窗里勾选同意"})
+            ok, msg, target = delete_saves(items, str(body.get("dest", ""))[:500])
+            return self._json({"ok": ok, "msg": msg, "dest": target})
+
+        if u.path == "/api/dirs":
+            return self._json(list_dirs(str(body.get("path", ""))[:500]))
+
         if u.path == "/api/file":
             full = safe_path(str(body.get("path", "")))
             if not full:
@@ -2828,6 +4687,23 @@ class Handler(BaseHTTPRequestHandler):
             text, _ = read_file(commands_path())
             entries = parse_commands(text)
             kv = {str(k).lower(): ("" if v is None else str(v)) for k, v in body.get("kv", {}).items()}
+            warn = ""
+            if "map" in kv:
+                kv["map"] = kv["map"].strip()
+                if not kv["map"]:
+                    # 空地图会让游戏悄悄退回 PEI, 一律拒绝写入这一项
+                    del kv["map"]
+                    warn = "地图不能为空, 本次没有修改地图"
+                else:
+                    kv["map"], found = norm_map_name(kv["map"])
+                    if not found:
+                        warn = (f"地图「{kv['map']}」在 Maps 文件夹和存档 Level 里都没找到, "
+                                f"重启服务器后可能退回默认地图 PEI")
+            for k in ("maxplayers", "port"):
+                # 空数字会写成没有值的 "Maxplayers" 行, 游戏当成没设置 -> 直接拒写这一项
+                if k in kv and not re.fullmatch(r"[0-9]+", kv[k].strip()):
+                    del kv[k]
+                    warn = (warn + "; " if warn else "") + f"{k} 要填数字, 本次没有修改它"
             seen = set()
             for e in entries:
                 if not e["key"]:
@@ -2851,8 +4727,13 @@ class Handler(BaseHTTPRequestHandler):
                 elif kv.get("pve") == "":
                     entries.append({"key": "PVE", "value": "", "comment": "//PVE 或 PVP"})
             write_file(commands_path(), build_commands(entries))
-            oplog("操作", "保存服务器设置 (Commands.dat)")
-            return self._json({"ok": True})
+            if "map" in kv:
+                oplog("操作", f"保存服务器设置 (Commands.dat) · 地图 = {kv['map']}")
+                if warn:
+                    oplog("错误", f"地图检查: {warn}")
+            else:
+                oplog("操作", "保存服务器设置 (Commands.dat)")
+            return self._json({"ok": True, "warn": warn})
 
         if u.path == "/api/workshop":
             full = os.path.join(server_dir(), "WorkshopDownloadConfig.json")
@@ -2860,11 +4741,41 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(read_file(full)[0]) if os.path.isfile(full) else {}
             except Exception:
                 data = {}
-            data["File_IDs"] = [int(i) for i in body.get("ids", [])]
-            data["Ignore_IDs"] = [int(i) for i in body.get("ignores", [])]
+            try:
+                fids = [int(i) for i in body.get("ids", [])]
+                iids = [int(i) for i in body.get("ignores", [])]
+            except (TypeError, ValueError):
+                return self._json({"ok": False, "msg": "模组 ID 必须是数字"}, 400)
+            data["File_IDs"] = list(dict.fromkeys(fids))
+            data["Ignore_IDs"] = list(dict.fromkeys(iids))
             write_file(full, json.dumps(data, indent=2, ensure_ascii=False))
             oplog("操作", f"保存创意工坊列表 ({len(data['File_IDs'])} 个模组)")
             return self._json({"ok": True})
+
+        if u.path == "/api/workshop/info":
+            raw = body.get("text") or ""
+            ids = ws_extract_ids(raw) if raw else [
+                int(i) for i in body.get("ids", []) if str(i).strip().isdigit()]
+            if not ids:
+                return self._json({"ok": False, "msg": "没有识别到模组 ID (需要 6 位以上数字)"})
+            rows, err = workshop_info(ids)
+            if err and not rows:
+                oplog("错误", f"创意工坊查询失败: {err}")
+                return self._json({"ok": False, "msg": err})
+            oplog("操作", f"查询创意工坊模组信息 ({len(rows)} 条)")
+            return self._json({"ok": True, "items": rows, "err": err})
+
+        if u.path == "/api/cheat":
+            on = bool(body.get("on"))
+            ok, msg = set_cheat(on)
+            if ok:
+                d = get_server_defaults()
+                d["cheat"] = on
+                save_server_defaults(d)
+                oplog("操作", f"仪表盘默认开服选项: 作弊 → {'开启' if on else '关闭'} (当前存档+新建默认)")
+            else:
+                oplog("错误", f"作弊开关失败: {msg}")
+            return self._json({"ok": ok, "msg": msg})
 
         if u.path == "/api/toggle":
             tid = body.get("id")
@@ -2878,8 +4789,17 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as e:
                 oplog("错误", f"开关写入失败 {tid}: {e}")
                 return self._json({"ok": False, "msg": str(e)})
+            extra = ""
+            if body.get("as_default") and tid in DASH_TOGGLE_IDS:
+                d = get_server_defaults()
+                tl = set(d["toggles"])
+                (tl.add if on else tl.discard)(tid)
+                d["toggles"] = [x for x in DASH_TOGGLE_IDS if x in tl]
+                save_server_defaults(d)
+                extra = "; 已存为新建服务器默认"
             oplog("操作", f"一键开关「{t['name']}」→ {'开启' if on else '恢复默认'}")
-            return self._json({"ok": True, "msg": f"「{t['name']}」已{'开启' if on else '恢复默认'}, 重启服务器后生效"})
+            return self._json({"ok": True,
+                               "msg": f"「{t['name']}」已{'开启' if on else '恢复默认'}, 重启服务器后生效" + extra})
 
         if u.path == "/api/select":
             s = next((x for x in SELECTS if x["id"] == body.get("id")), None)
@@ -2958,18 +4878,20 @@ def main():
     except Exception:
         pass
     secret = login_key()
-    # 把本次登录密钥放进剪贴板, 打开网页后直接 Ctrl+V
+    url = f"http://{HOST}:{PORT}/?key={secret}"
+    # 把带密钥的完整网址放进剪贴板: 粘到浏览器地址栏即可一步自动登录
     try:
         p = subprocess.Popen(["clip"], stdin=subprocess.PIPE)
-        p.communicate(secret.encode("ascii", "ignore"))
+        p.communicate(url.encode("ascii", "ignore"))
     except OSError:
         pass
     oplog("操作", "开服器启动")
     print("=" * 58)
-    print("  Dawn Sharkk 已启动 (Unturned 开服器)")
-    print(f"  网页地址: http://{HOST}:{PORT}   (请自行用浏览器打开)")
+    print("  Dawn Sharkk 已启动 (Unturned 开服器 v%s)" % VERSION)
+    print(f"  网页地址: {url}")
     print(f"  登录密钥: {secret}")
-    print("  >> 已自动复制到剪贴板, 打开网页后直接 Ctrl+V 粘贴 <<")
+    print("  >> 上面那行完整网址已复制到剪贴板: 打开浏览器地址栏 Ctrl+V 回车, 免输密钥直接登录 <<")
+    print(f"  >> 网址自动登录有效期 30 分钟 (到 {time.strftime('%H:%M', time.localtime(time.time() + KEY_AUTO_WINDOW))}), 超时需在登录框手动粘贴密钥 <<")
     print("=" * 58)
     if setup_done():
         print(f"  游戏目录: {game_dir()}")
