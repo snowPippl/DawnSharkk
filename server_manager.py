@@ -6,7 +6,7 @@ Unturned 服务器开服器 (本地网页版 · 萌新友好版)
         傻瓜式一键设置(死亡不掉落/建筑无敌/车辆无敌/免道具看地图等)、Commands.dat / Config.txt 汉化编辑、
         服务器图标与大厅链接(图床)、Rocket 指令反馈汉化、
         创意工坊模组、建筑与玩家存档备份/删除(删前强制备份)、全部配置文件(含 Rocket 插件)读取与修改、明/暗主题切换
-- 纯 Python 标准库, 自带免安装 Python, 双击 启动开服器.bat 即用
+- 纯 Python 标准库, 自带免安装 Python, 双击 DawnSharkk.exe 即用 (备用: 启动开服器.bat)
 """
 import json
 import os
@@ -20,6 +20,8 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
+import http.client
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, urlencode
@@ -30,7 +32,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 OPLOG_PATH = os.path.join(BASE_DIR, "操作日志.txt")
 HOST, PORT = "127.0.0.1", 8787
-VERSION = "0.1.8"            # 发布版本号: 改这里 + 新增 更新内容-版本号.md + 跑 发布打包.bat
+VERSION = "0.1.12"           # 发布版本号: 改这里 + 新增 更新内容-版本号.md + 跑 发布打包.py
+# 发行版本: full = 完整版 (自带 SteamCMD 下载开服端)。从 v0.1.12 起只发完整版 ——
+# 自带的工具才 1.6 MB, 再单独出一份"没有下载功能"的简装版没意义。
+# lite 分支的代码保留, 只为兼容手里还拿着旧简装包的人。
+EDITION = "full"
+LITE = EDITION != "full"
+VER_LABEL = "v" + VERSION + (" · 简装版" if LITE else "")
 
 # 项目仓库: 侧边栏只显示 GitHub 图标 + 名称, 不把网址写在页面上
 REPO_URL = "https://github.com/snowPippl/DawnSharkk"
@@ -87,12 +95,95 @@ def server_dir():
 
 def setup_done():
     sd = server_dir()
-    return bool(sd and os.path.isfile(os.path.join(game_dir(), "Unturned.exe"))
-                and os.path.isdir(sd))
+    return bool(sd and game_exe_ok(game_dir()) and os.path.isdir(sd))
+
+
+# 游戏本体 (客户端) 和专用开服端里都有 Unturned.exe, 光看 exe 分不出来。
+# 真机上能区分的只有这几样: 客户端有 BattlEye 客户端程序、steam_appid.txt 写 304930,
+# 还带 Worlds / Preferences.json; 开服端 (Steam 或 SteamCMD 下的) 三样都没有。
+# 判据别放宽 —— Servers / Modules / Extras / BattlEye 这些两边都有, 拿来判断会误伤。
+CLIENT_APPID = "304930"
+
+
+def client_dir_reason(gdir):
+    """空串 = 不像游戏本体; 否则返回给用户看的判据"""
+    if not gdir or not os.path.isdir(gdir):
+        return ""
+    if os.path.isfile(os.path.join(gdir, "Unturned_BE.exe")):
+        return "目录里有 Unturned_BE.exe"
+    try:
+        with open(os.path.join(gdir, "steam_appid.txt"),
+                  encoding="utf-8", errors="replace") as f:
+            if f.readline().strip() == CLIENT_APPID:
+                return f"steam_appid.txt 写着 {CLIENT_APPID}"
+    except OSError:
+        pass
+    if os.path.isdir(os.path.join(gdir, "Worlds")) \
+            and os.path.isfile(os.path.join(gdir, "Preferences.json")):
+        return "目录里有 Worlds 和 Preferences.json"
+    return ""
 
 
 def game_exe_ok(gdir):
-    return bool(gdir) and os.path.isfile(os.path.join(gdir, "Unturned.exe"))
+    """能不能当游戏目录用: 有 Unturned.exe, 而且不是游戏本体"""
+    return (bool(gdir) and os.path.isfile(os.path.join(gdir, "Unturned.exe"))
+            and not client_dir_reason(gdir))
+
+
+def check_game_dir(gdir):
+    """返回空串表示可以用, 否则返回一句萌新看得懂的报错"""
+    if not gdir or not os.path.isdir(gdir):
+        return "这个文件夹不存在, 请检查路径有没有写全"
+    why = client_dir_reason(gdir)
+    if why:
+        return ("这是 Unturned 游戏本体的目录, 不能拿来开服 ({}). ".format(why)
+                + "开服要用 Steam 免费的「Unturned - Dedicated Server」(U3DS), 它和本体是两个东西。"
+                + ("本机没有的话, 回到第 1 步点「🛒 在 Steam 商店打开开服端」装一个 (免费), "
+                   "商店那条路走不动再点备用的「🔻 用 SteamCMD 下载」"
+                   if not LITE else
+                   "本机没有的话, 先在 Steam 商店装一个免费的 Unturned - Dedicated Server (U3DS)"))
+    if not os.path.isfile(os.path.join(gdir, "Unturned.exe")):
+        return "该目录下没有找到 Unturned.exe, 请确认是 U3DS 服务器目录"
+    return ""
+
+
+def bound_dir_error():
+    """当前 settings.json 里绑的目录有什么问题 (空串 = 正常)"""
+    g = game_dir()
+    return "请先设置有效的游戏目录" if not g else check_game_dir(g)
+
+
+def steam_library_roots():
+    """这台电脑上所有 Steam 库的根目录 (注册表 + 各盘常见位置 + libraryfolders.vdf)"""
+    roots, seen = [], set()
+
+    def add(r):
+        r = os.path.normpath(str(r or ""))
+        k = os.path.normcase(r)
+        if r and k not in seen and os.path.isdir(r):
+            seen.add(k)
+            roots.append(r)
+
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
+            add(winreg.QueryValueEx(k, "SteamPath")[0])
+    except (OSError, ImportError):
+        pass
+    for drv in "CDEFGH":
+        for tail in (r"Program Files (x86)\Steam", "Steam", "SteamLibrary",
+                     r"Epic Games\Steam"):
+            add(os.path.join(f"{drv}:\\", tail))
+    for root in list(roots):
+        vdf = os.path.join(root, "steamapps", "libraryfolders.vdf")
+        if os.path.isfile(vdf):
+            try:
+                with open(vdf, encoding="utf-8", errors="replace") as f:
+                    for m in re.finditer(r'"path"\s+"([^"]+)"', f.read()):
+                        add(m.group(1).replace("\\\\", "\\"))
+            except OSError:
+                pass
+    return roots
 
 
 def detect_game_dirs():
@@ -104,33 +195,19 @@ def detect_game_dirs():
         if game_exe_ok(p) and os.path.normcase(p) not in map(os.path.normcase, found):
             found.append(p)
 
-    steam_roots = []
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
-            steam_roots.append(winreg.QueryValueEx(k, "SteamPath")[0])
-    except OSError:
-        pass
-    for drv in "CDEFGH":
-        steam_roots.append(f"{drv}:\\Program Files (x86)\\Steam")
-        steam_roots.append(f"{drv}:\\Steam")
-        steam_roots.append(f"{drv}:\\SteamLibrary")
-        steam_roots.append(f"{drv}:\\Epic Games\\Steam")
-
-    libs = set()
-    for root in steam_roots:
+    for root in steam_library_roots():
         add(os.path.join(root, "steamapps", "common", "U3DS"))
-        vdf = os.path.join(root, "steamapps", "libraryfolders.vdf")
-        if os.path.isfile(vdf):
-            try:
-                with open(vdf, encoding="utf-8", errors="replace") as f:
-                    for m in re.finditer(r'"path"\s+"([^"]+)"', f.read()):
-                        libs.add(m.group(1).replace("\\\\", "\\"))
-            except OSError:
-                pass
-    for lib in libs:
-        add(os.path.join(lib, "steamapps", "common", "U3DS"))
-        add(os.path.join(lib, "SteamLibrary", "steamapps", "common", "U3DS"))
+        add(os.path.join(root, "SteamLibrary", "steamapps", "common", "U3DS"))
+    return found
+
+
+def detect_client_dirs():
+    """本机的 Unturned 游戏本体目录 —— 只用来比对版本, 拿它开服会报错"""
+    found = []
+    for root in steam_library_roots():
+        p = os.path.normpath(os.path.join(root, "steamapps", "common", "Unturned"))
+        if client_dir_reason(p) and os.path.normcase(p) not in map(os.path.normcase, found):
+            found.append(p)
     return found
 
 
@@ -168,6 +245,709 @@ def create_instance(name):
                             encoding="utf-8").read())
     port = port_m.group(1) if port_m else "27015"
     return True, f"存档「{name}」已创建 (端口 {port})"
+
+
+# ================================================================ 开服端下载 (SteamCMD)
+# Steam 商店搜 "Unturned - Dedicated Server" 即可核对这个 appid (它是免费的专用服务器端)。
+# 走 Valve 官方 steamcmd + 匿名登录, 不是第三方镜像站, 也不碰用户的 Steam 账号。
+DEDI_APPID = "1110390"
+# 商店页: 优先推荐朋友走这条路 (Steam 客户端里点安装最省事), steamcmd 只当备用
+DEDI_STORE_URL = "https://store.steampowered.com/app/1110390/Unturned__Dedicated_Server/"
+STEAMCMD_ZIP_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
+DL_PROGRESS_RE = re.compile(r"progress:\s*([\d.]+)\s*\((\d+)\s*/\s*(\d+)\)", re.I)
+DL_STATE_RE = re.compile(r"Update state \((0x[0-9a-f]+)\)\s*([^,]*)", re.I)
+# steamcmd 的两类致命失败长得完全不一样, 必须分开翻译, 不然用户会被「网络不通」带进死胡同
+DL_PATH_ERR_RE = re.compile(r"non-english|incompatible path|cannot run from a folder", re.I)
+DL_LICENSE_ERR_RE = re.compile(r"no app license|not owning instance|owned app is not available", re.I)
+# Steam 那头一次没把应用信息递过来 (真机实测: 同一个目录原地重跑一次就装完了)。
+# 这类绝不能报成「你的网络不行」, 也不能让用户手点第五遍。
+DL_RETRY_ERR_RE = re.compile(r"missing configuration|unable to update prior app state|"
+                             r"failed to install app .*?\(unavailable\)", re.I)
+DL_UP_TO_DATE_RE = re.compile(r"already up to date", re.I)
+
+
+class _DlAbort(Exception):
+    pass
+
+
+DL = {"state": "idle", "stage": "", "detail": "", "pct": 0.0, "got": 0, "total": 0,
+      "speed": 0.0, "dest": "", "result": "", "msg": "", "log": deque(maxlen=60)}
+DL_LOCK = threading.Lock()
+DL_PROC = None
+_dl_stop = threading.Event()
+
+
+def tool_dir():
+    """下载来的小工具放哪 (默认开服器文件夹下的 工具\\)"""
+    return _settings.get("tool_dir") or os.path.join(BASE_DIR, "工具")
+
+
+def ascii_path(p):
+    """路径里能不能只有英文字符 —— steamcmd 见到中文路径会当场 Fatal Error 退出"""
+    try:
+        str(p).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _drive_ready(p):
+    """路径所在盘在不在 (软盘/光驱/没插好的移动硬盘都会 False)"""
+    root = os.path.splitdrive(str(p))[0]
+    if not root:
+        return False
+    return os.path.isdir(root + "\\")
+
+
+def steamcmd_dir():
+    """steamcmd 自己的窝, 必须是纯英文路径。
+
+    Valve 的 steamcmd 启动时检查自身所在文件夹: 路径带中文就直接
+    「Fatal Error: cannot run from a folder path that includes non-English characters」,
+    连网络都不碰。所以开服器装在中文文件夹里 (桌面/中文用户名/工具\\) 时要另找地方。
+    """
+    cand = [os.path.join(tool_dir(), "steamcmd"),
+            os.path.join(BASE_DIR, "tools", "steamcmd")]
+    cand += [f"{drv}:\\DawnSharkTools\\steamcmd" for drv in "DEFGHIJKC"]
+    for d in cand:
+        if ascii_path(d) and _drive_ready(d):
+            return d
+    for d in cand:
+        if ascii_path(d):
+            return d
+    return "D:\\DawnSharkTools\\steamcmd"
+
+
+def dedi_default_dest():
+    """开服端默认下载位置: 同样必须纯英文, 而且要留够空间。
+
+    查空间只能查盘符根目录 —— 建议的位置这会儿还不存在, 对它调 disk_usage 会直接抛错。
+    """
+    cand = [os.path.join(BASE_DIR, "U3DS")] + [f"{drv}:\\U3DS" for drv in "DEFGHIJC"]
+    for p in cand:
+        root = os.path.splitdrive(p)[0] + "\\"
+        try:
+            if ascii_path(p) and os.path.isdir(root) and shutil.disk_usage(root).free > 3 << 30:
+                return p
+        except OSError:
+            continue
+    for p in cand:
+        if ascii_path(p):
+            return p
+    return "D:\\U3DS"
+
+
+def dl_set(**kw):
+    with DL_LOCK:
+        DL.update(kw)
+
+
+def dl_log(line):
+    line = str(line).strip()
+    if line:
+        with DL_LOCK:
+            DL["log"].append(line[:220])
+
+
+def dl_snapshot():
+    with DL_LOCK:
+        out = {k: v for k, v in DL.items() if k != "log"}
+        out["log"] = list(DL["log"])[-30:]
+        out["running"] = out["state"] == "running"
+        return out
+
+
+def find_steamcmd():
+    """找本机已有的 steamcmd: 手动指定 → 开服器下的 工具\\ → Steam 目录 → 常见安装位置 → PATH
+
+    只认纯英文路径的: 放在中文文件夹里的 steamcmd 根本跑不起来, 宁可不复用。
+    """
+    cand = []
+    s = _settings.get("steamcmd")
+    if s:
+        cand.append(s)
+    cand.append(os.path.join(steamcmd_dir(), "steamcmd.exe"))
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
+            sp = winreg.QueryValueEx(k, "SteamPath")[0]
+        cand += [os.path.join(sp, "steamcmd.exe"),
+                 os.path.join(sp, "steamapps", "common", "SteamCMD", "steamcmd.exe")]
+    except (OSError, ImportError):
+        pass
+    for drv in "CDEFGH":
+        for tail in ("SteamCMD", r"steamcmd", r"tools\steamcmd", r"Program Files (x86)\SteamCMD"):
+            cand.append(os.path.join(f"{drv}:\\", tail, "steamcmd.exe"))
+    g = game_dir()
+    if g:
+        cand.append(os.path.join(os.path.dirname(os.path.abspath(g)), "steamcmd", "steamcmd.exe"))
+    for p in cand:
+        if p and ascii_path(p) and os.path.isfile(p):
+            return os.path.abspath(p)
+    w = shutil.which("steamcmd") or shutil.which("steamcmd.exe")
+    if w and ascii_path(w):
+        return os.path.abspath(w)
+    return None
+
+
+def scan_dedi_installs():
+    """再查一遍本机有没有现成的开服端 —— 点下载时必须先跑这个, 别白下 1.5 GB"""
+    found, seen = [], set()
+
+    def add(p):
+        p = os.path.normpath(str(p))
+        if not game_exe_ok(p) or os.path.normcase(p) in seen:
+            return
+        seen.add(os.path.normcase(p))
+        base = os.path.join(p, "Servers")
+        try:
+            n_inst = len([d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))]) \
+                if os.path.isdir(base) else 0
+            mt = os.path.getmtime(os.path.join(p, "Unturned.exe"))
+        except OSError:
+            n_inst, mt = 0, 0
+        found.append({"path": p, "instances": n_inst,
+                      "rocket": os.path.isdir(os.path.join(p, "Modules", "Rocket.Unturned")),
+                      "time": time.strftime("%Y-%m-%d", time.localtime(mt)) if mt else ""})
+
+    for p in detect_game_dirs():
+        add(p)
+    for p in (_settings.get("game_dir"), _settings.get("dedi_dest"),
+              dedi_default_dest(), os.path.join(BASE_DIR, "U3DS"),
+              os.path.join(BASE_DIR, "Unturned服务器")):
+        if p:
+            add(p)
+    found.sort(key=lambda d: os.path.normcase(d["path"]) != os.path.normcase(game_dir() or ""))
+    return found
+
+
+def check_dest(p):
+    """下载目标路径校验: 必须是盘符下的完整路径, 必须纯英文, 且不能是盘符根/系统目录"""
+    p = str(p or "").strip().strip('"').replace("/", "\\").rstrip("\\")
+    if not re.match(r"^[A-Za-z]:\\", p + "\\"):
+        return False, "请填写完整路径, 例如 G:\\U3DS"
+    if ".." in re.split(r"[\\/]", p):
+        return False, "路径里不能用 .."
+    root = p[:2] + "\\"
+    if not os.path.isdir(root):
+        return False, f"{root} 这个盘不存在, 或者硬盘还没插好"
+    if os.path.normcase(p) == os.path.normcase(root.rstrip("\\")):
+        return False, ("不能直接下载到盘符根目录 (例如 " + root +
+                       ")。请在盘里新建一个文件夹, 例如 " + root + "U3DS")
+    if not ascii_path(p):
+        return False, ("这个路径里有中文或其他非英文字符, 而 steamcmd 只认英文 —— "
+                       "Valve 的程序一看到中文文件夹就直接报错退出 (跟网络无关)。"
+                       "请把下载位置改成纯英文, 例如 " + root + "U3DS 或 " + root + "games\\U3DS")
+    risky = {os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows")),
+             os.path.normcase(os.path.expanduser("~")),
+             os.path.normcase(os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"))),
+             os.path.normcase(os.path.dirname(sys.executable))}
+    if os.path.normcase(p) in risky:
+        return False, "这个位置太靠近系统目录了, 换一个新建的子文件夹 (例如 G:\\U3DS)"
+    if len(p) < 5:
+        return False, "路径太短了, 请写到一个具体的子文件夹里"
+    return True, p
+
+
+def _dl_http(url, dst, label, tries=5):
+    """下一个小文件: 断在半路就带 Range 续传, 不从 0 重来。
+
+    国内连 Akamai 经常读到九成多就 read timeout, 一次都不重试等于逼用户手点好几遍。
+    读超时故意设得短: 卡住时早点断线重连, 比死等 60 秒更快续上。
+    """
+    got = total = 0
+    t0 = last_ui = time.time()
+    last_err = None
+    for n in range(tries):
+        if _dl_stop.is_set():
+            raise _DlAbort("已取消")
+        if n:
+            time.sleep(min(1.5 * n, 6))
+            dl_log("第 %d 次重试: 从已下的 %d KB 处接着下" % (n + 1, got // 1024))
+        hdr = {"User-Agent": "DawnSharkk/" + VERSION}
+        if got:
+            hdr["Range"] = "bytes=%d-" % got
+        try:
+            r = urllib.request.urlopen(
+                urllib.request.Request(url, headers=hdr), timeout=25)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            last_err = e
+            continue
+        done = False
+        with r:
+            cr = (r.headers.get("Content-Range") or "").strip()
+            if got and cr.lower().startswith("bytes "):
+                try:
+                    total = int(cr.rsplit("/", 1)[-1])
+                except ValueError:
+                    total = 0
+            else:                                   # 服务器不认续传: 只能从头下
+                got = 0
+                try:
+                    total = int(r.headers.get("Content-Length") or 0)
+                except ValueError:
+                    total = 0
+            with open(dst, "ab" if got else "wb") as f:
+                while True:
+                    if _dl_stop.is_set():
+                        raise _DlAbort("已取消")
+                    try:
+                        chunk = r.read(65536)
+                    except (OSError, http.client.HTTPException,
+                            urllib.error.URLError) as e:
+                        last_err = e
+                        break
+                    if not chunk:
+                        done = True
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    now = time.time()
+                    if now - last_ui >= 0.4:
+                        last_ui = now
+                        dl_set(stage=label, got=got, total=total,
+                               speed=got / max(now - t0, 0.1),
+                               pct=(got * 100.0 / total) if total else 0.0)
+        if done and (not total or got >= total):
+            return got
+    raise _DlAbort(
+        "下不动 SteamCMD: %s (已重试 %d 次, 每次都从断点接着下)。这一步只是拿不到 1 MB 的"
+        "官方 steamcmd, 和 1.5 GB 开服端无关。v0.1.11 起的完整版已经把 steamcmd 自带在"
+        " tools\\steamcmd 里了, 走不到这一步 —— 如果你看到这句, 说明那份被删掉了 (或所在文件夹"
+        "没能复制出去), 重新解压一份完整包到纯英文路径即可; 急着开服的话也可以先开个 Steam 加速器再点一次"
+        % (last_err, tries))
+
+
+def bundled_steamcmd():
+    """发布包里自带的那份 steamcmd —— 有它就完全不用去下那 757 KB 的 zip。
+
+    国内连 Valve 的 Akamai 经常读到九成多就断, 而这一步只是拿工具本身, 断在哪都很没道理。
+    """
+    p = bundled_exe()
+    return os.path.abspath(p) if (ascii_path(p) and os.path.isfile(p)) else None
+
+
+def bundled_exe():
+    return os.path.join(BASE_DIR, "tools", "steamcmd", "steamcmd.exe")
+
+
+def ensure_steamcmd():
+    """返回 (可用路径 or None, 是否是我们自己下的)"""
+    b = bundled_steamcmd()
+    if b:
+        dl_set(stage="① 准备 SteamCMD", detail="用开服器自带的一份, 不用联网下载")
+        dl_log("使用开服器自带的 SteamCMD (跳过下载): " + b)
+        return b, False
+    exe = find_steamcmd()
+    if exe:
+        dl_set(stage="① 准备 SteamCMD", detail="复用本机已有的 steamcmd")
+        dl_log("复用已有 SteamCMD: " + exe)
+        return exe, False
+    d = steamcmd_dir()
+    exe = os.path.join(d, "steamcmd.exe")
+    if os.path.isfile(exe):
+        dl_set(stage="① 准备 SteamCMD", detail="复用上次下载的 steamcmd")
+        dl_log("复用上次下载的 SteamCMD: " + exe)
+        return exe, False
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        raise _DlAbort(
+            "这台电脑上没能建出放 steamcmd 的英文文件夹 (盘符根目录通常不让直接写)。"
+            "手动建一个纯英文文件夹, 例如 D:\\DawnSharkTools, 再点一次试试") from None
+    src = bundled_exe()
+    if os.path.isfile(src):
+        # 走到这里说明自带那份没被直接用掉, 只因开服器所在的文件夹带中文 —— 抄一份到英文文件夹, 照样不用联网
+        try:
+            shutil.copy2(src, exe)
+        except OSError:
+            dl_log("自带的 SteamCMD 没能复制到 " + d + ", 改为联网下载")
+        else:
+            dl_set(stage="① 准备 SteamCMD", detail="用开服器自带的一份, 不用联网下载")
+            dl_log("自带 SteamCMD 的路径含中文跑不动, 已复制一份到英文文件夹: " + exe)
+            return exe, False
+    zp = os.path.join(d, "steamcmd.zip")
+    dl_set(stage="① 下载官方 SteamCMD", detail="正在从 Valve 官方服务器下载 (不到 1 MB)")
+    if os.path.splitdrive(d)[0].lower() != os.path.splitdrive(BASE_DIR)[0].lower():
+        dl_log("开服器所在的文件夹路径含中文, SteamCMD 改放到 " + d)
+    try:
+        _dl_http(STEAMCMD_ZIP_URL, zp, "① 下载官方 SteamCMD")
+        dl_set(stage="① 解压 SteamCMD", pct=100.0)
+        with zipfile.ZipFile(zp) as zf:
+            zf.extractall(d)
+    finally:
+        try:
+            os.remove(zp)
+        except OSError:
+            pass
+    if not os.path.isfile(exe):
+        return None, False
+    dl_log("SteamCMD 已解压到 " + d)
+    return exe, True
+
+
+def _kill_tree(proc):
+    try:
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _steamcmd_err(err_line, dest):
+    """把 steamcmd 的英文报错翻译成人话: 路径 / Steam 抽风 / 许可证 / 网络 四类绝不能混着说"""
+    root = (dest or "D:")[:2] + "\\"
+    if DL_PATH_ERR_RE.search(err_line or ""):
+        return ("开服端所在的文件夹路径里有中文, 而 Valve 的 steamcmd 只认英文, 一看到中文就直接退出 "
+                "(这一条和网络无关, 加速器帮不上)。把这一项改成纯英文的位置, 例如 " + root + "U3DS; "
+                "开服器自己那份 steamcmd 会挪到英文文件夹里, 不用你搬整个开服器")
+    if DL_RETRY_ERR_RE.search(err_line or ""):
+        return ("Steam 那一头刚才没把开服端的应用信息递过来, 这一条重跑一次基本就好, "
+                "和路径、设置都没关系 (开服器已经自动重试过几轮)。等一两分钟再点一次"
+                "「开始下载」; 反复都这样再开个 Steam 加速器 —— 卡的是 Steam 的元数据服务器, "
+                "不是那 1.5 GB 的下载")
+    if DL_LICENSE_ERR_RE.search(err_line or ""):
+        return ("Steam 说这个应用不归这个账号 (匿名下载偶尔抽风)。"
+                "先开个 Steam 加速器再重试一次; 还是不行就在 Steam「库 → 工具」里"
+                "安装一次 Unturned - Dedicated Server, 装完回到这一页点「重新检测本机」")
+    if err_line:
+        return ("多半是网络不通: 国内直连 Valve 下载服务器经常卡住, "
+                "开个 Steam 加速器再重试一次。实在不行的兜底路径: Steam「库 → 工具」里"
+                "安装 Unturned - Dedicated Server (免费), 装完点「重新检测本机」")
+    return ("下载跑完了, 但目标文件夹里没有 Unturned.exe —— 可能是磁盘满了或中途断网。"
+            "看一下下面最后几行 steamcmd 的输出")
+
+
+def _steamcmd_once(exe, dest, update=False):
+    """跑一趟 steamcmd 装/更新开服端。update=True 时目标是已经存在的开服端目录"""
+    global DL_PROC
+    if not ascii_path(exe) or not ascii_path(dest):
+        return False, _steamcmd_err("non-english", dest), ""
+    args = [exe, "+force_install_dir", dest, "+login", "anonymous",
+            "+app_update", DEDI_APPID, "validate", "+quit"]
+    what = "更新开服端" if update else "下载开服端"
+    dl_set(stage="② " + what, detail=f"Steam 应用 {DEDI_APPID} → {dest}")
+    dl_log("正在启动 steamcmd (窗口不会显示, 进度看这里)…")
+    proc = subprocess.Popen(args, cwd=os.path.dirname(exe), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace", bufsize=1,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    with DL_LOCK:
+        DL_PROC = proc
+    err_line = ""
+    fatal_line = ""
+    uptodate = False
+    try:
+        while True:
+            if _dl_stop.is_set():
+                _kill_tree(proc)
+                return False, "下载已取消", ""
+            line = proc.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            dl_log(line)
+            m = DL_PROGRESS_RE.search(line)
+            if m:
+                dl_set(pct=min(100.0, float(m.group(1))), got=int(m.group(2)),
+                       total=int(m.group(3)))
+            m = DL_STATE_RE.search(line)
+            if m and m.group(2).strip():
+                dl_set(detail=f"{m.group(2).strip()} · {dest}")
+            low = line.lower()
+            if low.startswith("error!") or low.startswith("fatal error") \
+                    or "assertion failed" in low or "no app license" in low:
+                fatal_line = line
+            elif "failed" in low or "unable to" in low:
+                err_line = err_line or line
+            if DL_UP_TO_DATE_RE.search(line):
+                uptodate = True
+        proc.wait(timeout=60)
+    finally:
+        with DL_LOCK:
+            DL_PROC = None
+    rc = proc.returncode
+    got = dedi_root(dest)
+    if _dl_stop.is_set():
+        return False, "下载已取消", ""
+    # steamcmd 明确说了已是最新 = 成功; 更新一个已经能跑的开服端时, 目录里本来就有
+    # Unturned.exe, 不能拿「目录存在」当成功依据, 否则 Fatal Error 会被当成更新完成
+    if uptodate and got:
+        dl_set(pct=100.0)
+        return True, ("已经是最新版本, 不用更新 ✔ 重启服务器就能继续玩" if update
+                      else "开服端下载完成 🎉 点「用这个目录」就能接着建存档"), got
+    if fatal_line:
+        return False, (_steamcmd_err(fatal_line, dest) +
+                       " (steamcmd 原话: " + fatal_line[:150] + ")"), ""
+    if err_line and not got:
+        return False, (_steamcmd_err(err_line, dest) +
+                       " (steamcmd 原话: " + err_line[:150] + ")"), ""
+    if not got:
+        return False, _steamcmd_err("", dest), ""
+    if rc not in (0, None):
+        return False, (_steamcmd_err(err_line, dest) +
+                       f" (steamcmd 以错误码 {rc} 退出, 看一下下面最后几行的输出)"), ""
+    dl_set(pct=100.0)
+    if update:
+        return True, "开服端已更新到最新版 🎉 重启服务器后玩家就能进来了", got
+    return True, "开服端下载完成 🎉 点「用这个目录」就能接着建存档", got
+
+
+def _run_steamcmd(exe, dest, update=False, tries=3):
+    """跑 steamcmd 装开服端, 遇到「Steam 没递上应用信息」这类原地重跑
+
+    真机复现过: 同一份 steamcmd、同一个目录, 第一趟报 Missing configuration,
+    第二趟就把 1.86 GB 全装完了。这种事让用户手点三遍不如我们替他点。
+    """
+    for n in range(1, tries + 1):
+        if _dl_stop.is_set():
+            return False, "下载已取消", ""
+        ok, msg, got = _steamcmd_once(exe, dest, update)
+        if ok or not DL_RETRY_ERR_RE.search(msg or ""):
+            return ok, msg, got
+        if n < tries:
+            dl_log("Steam 没递上开服端的应用信息, 稍等几秒自动重跑第 %d 趟 (不用你管)…" % (n + 1))
+            for _ in range(3):
+                if _dl_stop.is_set():
+                    return False, "下载已取消", ""
+                time.sleep(2)
+    return ok, msg, got
+
+
+def dedi_root(dest):
+    """steamcmd 有时直接把文件铺在目标目录, 有时会套一层 U3DS"""
+    for p in (dest, os.path.join(dest, "U3DS")):
+        if game_exe_ok(p):
+            return os.path.normpath(p)
+    return ""
+
+
+def _dl_worker(dest, update=False):
+    what = "更新" if update else "下载"
+    try:
+        dl_set(state="running", stage="准备中", detail="", pct=0.0, got=0, total=0,
+               speed=0.0, result="", msg="")
+        exe, fresh = ensure_steamcmd()
+        if not exe:
+            raise _DlAbort("拿不到 steamcmd: 官方包下载失败, 或解压后没找到 steamcmd.exe")
+        if fresh:
+            dl_log(f"SteamCMD 已就位, 开始{what}开服端")
+        ok, msg, path = _run_steamcmd(exe, dest, update=update)
+        if _dl_stop.is_set():
+            dl_set(state="cancelled", stage=f"{what}已取消", msg="已经取消了。随时可以再点「开始下载」")
+            oplog("操作", f"开服端{what}已取消: {dest}")
+            return
+        if ok:
+            _settings["dedi_dest"] = path
+            save_settings()
+            dl_set(state="done", stage="完成", result=path, msg=msg)
+            oplog("操作", f"开服端{what}完成: {path}")
+        else:
+            dl_set(state="error", stage=f"{what}失败", msg=msg)
+            oplog("错误", f"开服端{what}失败: {msg[:160]}")
+    except _DlAbort as e:
+        dl_set(state="cancelled" if _dl_stop.is_set() else "error",
+               stage=f"{what}已取消" if _dl_stop.is_set() else f"{what}失败", msg=str(e))
+        oplog("操作", f"开服端{what}中断: {e}")
+    except Exception as e:
+        dl_set(state="error", stage=f"{what}失败", msg=f"开服器{what}出错: {e}")
+        oplog("错误", f"开服端{what}异常: {e}")
+
+
+def start_download(dest, update=False):
+    if DL.get("state") == "running":
+        return False, "已经有一个下载/更新在进行了, 等它结束再试"
+    what = "更新" if update else "下载"
+    ok, info = check_dest(dest)
+    if not ok:
+        return False, info
+    dest = info
+    if update and not game_exe_ok(dest):
+        return False, "要更新的这个文件夹里没有 Unturned.exe, 不能当开服端更新"
+    _dl_stop.clear()
+    with DL_LOCK:
+        DL["log"].clear()
+    dl_set(state="running", dest=dest)
+    threading.Thread(target=_dl_worker, args=(dest,), kwargs={"update": update},
+                     daemon=True).start()
+    oplog("操作", f"开始{what} Unturned 开服端 (app {DEDI_APPID}) → {dest}")
+    return True, f"开始{what}了, 进度会显示在下面"
+
+
+def start_update():
+    """把当前绑定的开服端用 steamcmd 更新到最新版 (AppID 不变, validate 会补齐缺的文件)"""
+    if LITE:
+        return False, ("简装版不带 steamcmd: 请在 Steam「库 → 工具」里右键 "
+                       "Unturned - Dedicated Server → 更新")
+    dest = game_dir() or _settings.get("dedi_dest") or ""
+    if not game_exe_ok(dest):
+        return False, "还没有可用的开服端目录, 先去「初始设置」选好或下载一个"
+    if not ascii_path(dest):
+        return False, ("这个开服端所在的文件夹路径里有中文, steamcmd 更新不了它 (Valve 只认英文)。"
+                       "两个办法: ① 用 Steam 客户端更新 —— 库 → 按「工具」筛选 → 右键 "
+                       "Unturned - Dedicated Server → 更新; ② 把整个文件夹挪到纯英文路径 "
+                       "(例如 E:\\U3DS), 再回「初始设置」重新选一次目录")
+    return start_download(dest, update=True)
+
+
+def cancel_download():
+    if DL.get("state") != "running":
+        return False, "现在没有正在下载的开服端"
+    _dl_stop.set()
+    p = DL_PROC
+    if p:
+        _kill_tree(p)
+    dl_set(stage="正在取消…")
+    return True, "正在取消, 已下载的部分 steamcmd 会自动续上"
+
+
+def adopt_dedi(path):
+    """把刚下载好的开服端直接认作游戏目录"""
+    p = os.path.normpath(str(path or ""))
+    if not game_exe_ok(p):
+        p = dedi_root(p) or p
+    if not game_exe_ok(p):
+        return False, "这个目录里没有 Unturned.exe, 还不能当游戏目录用", None
+    _settings["game_dir"] = p
+    _settings["dedi_dest"] = p
+    if instance() and not os.path.isdir(os.path.join(p, "Servers", instance())):
+        _settings["instance"] = None
+    save_settings()
+    oplog("操作", f"选用下载好的开服端: {p}")
+    return True, "已经把开服端设为游戏目录", p
+
+
+# ================================================================ 开服端版本
+# exe 的文件版本读出来是 Unity 引擎版本 (本体和开服端一模一样), 判断不了游戏版本。
+# 真正写清楚版本的是游戏自己的日志: "Game version: 3.26.3.11 Engine version: 2022.3.62f3"
+GAME_VER_RE = re.compile(r"Game version:\s*([0-9][0-9A-Za-z.\-]*)")
+
+
+def version_tuple(s):
+    return tuple(int(x) for x in re.findall(r"\d+", str(s or ""))[:4])
+
+
+def _last_game_version(path):
+    """从日志末尾抓最后一次 Game version (每次启动都会写一遍, 取最后一次才是当前版本)"""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 262144))
+            data = f.read()
+    except OSError:
+        return ""
+    found = GAME_VER_RE.findall(data.decode("utf-8", errors="replace"))
+    return found[-1] if found else ""
+
+
+def _logs_under(root, rel, limit=6):
+    d = os.path.join(root or "", rel)
+
+    def mt(p):
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return 0.0
+
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    paths = [os.path.join(d, n) for n in names if n.lower().endswith(".log")]
+    paths.sort(key=mt, reverse=True)
+    return paths[:limit]
+
+
+def _newest_game_version(paths):
+    v, best_mt = "", 0.0
+    for p in paths:
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            continue
+        if mt < best_mt:
+            continue
+        got = _last_game_version(p)
+        if got:
+            v, best_mt = got, mt
+    return v
+
+
+def dedi_version():
+    """开服端上次启动时跑的游戏版本 —— 纯本地读日志, 不联网"""
+    g = game_dir()
+    if not g:
+        return ""
+    paths = _logs_under(g, "Logs")
+    base = os.path.join(g, "Servers")
+    try:
+        for name in os.listdir(base):
+            paths.append(os.path.join(base, name, "console.log"))
+    except OSError:
+        pass
+    return _newest_game_version(paths)
+
+
+def client_version():
+    """本机游戏本体的版本 —— 本体跟着 Steam 自动更新, 开服端不会, 差版本玩家就进不来"""
+    for d in detect_client_dirs():
+        v = _newest_game_version(_logs_under(d, "Logs"))
+        if v:
+            return v, d
+    return "", ""
+
+
+def version_report():
+    """开服端 / 本体版本对照, 给「服务器设置」和「初始设置」两处用"""
+    dv = dedi_version()
+    cv, cdir = client_version()
+    dt, ct = version_tuple(dv), version_tuple(cv)
+    return {"dedi": dv, "client": cv, "client_dir": cdir, "game_dir": game_dir() or "",
+            "stale": bool(dt and ct and ct > dt), "same": bool(dt and ct and ct == dt)}
+
+
+def dedi_version_card():
+    """「服务器设置」页: 开服端版本对照 + 一键更新 (进度条和初始设置的下载面板共用一套组件)"""
+    r = version_report()
+    head = (f'开服端上次运行的版本: <b style="color:var(--ok)">{esc(r["dedi"])}</b>' if r["dedi"]
+            else '开服端版本: 暂时读不到 (这个开服端完整跑过一次之后, 日志里才会有版本号)')
+    cl = (f'本机游戏本体的版本: <b>{esc(r["client"])}</b>' if r["client"]
+          else '本机游戏本体: 没检测到 (这台机器可能只装了开服端)')
+    if r["stale"]:
+        state = ('<div class="tip">⚠ <b>本体比开服端新了一版</b>。Steam 会自动把玩家的本体更新, '
+                 '但开服端不会自己动 —— 版本差开的常见结果是朋友点进服务器卡在加载那一格, '
+                 '或者提示版本不一致。点下面的按钮让开服器用 Steam 官方的 steamcmd 补到最新。</div>')
+    elif r["same"]:
+        state = '<div class="hint">两边版本对得上 ✔ 朋友能正常进服。</div>'
+    else:
+        state = '<div class="hint">读不全两边版本时, 这个按钮也会顺手向 Steam 核对一次最新构建。</div>'
+    if LITE:
+        btn = ('<div class="hint" style="margin-top:10px">简装版不带 steamcmd: 更新请在 Steam 里 '
+               '「库 → 按工具筛选 → 右键 Unturned - Dedicated Server → 更新」, '
+               '更新完重启开服器再看这一行。</div>')
+    else:
+        btn = """<div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+<button class="btn" id="dlgo" onclick="updateDedi()">🔄 检查并更新开服端 (SteamCMD)</button>
+<button class="btn gray" id="dlcancel" onclick="cancelDl()" style="display:none">✖ 取消</button>
+<span class="hint" id="dlmsg" style="margin:0"></span></div>
+<div class="bar" id="dlbar" style="display:none"><i id="dlfill"></i></div>
+<div class="hint" id="dlstage" style="white-space:pre-line"></div>
+<pre class="dllog" id="dllog" style="display:none"></pre>"""
+    return f"""<div class="card"><h2>开服端版本与更新</h2>
+<div class="desc">开服端就是这个文件夹: <code class="k">{esc(r["game_dir"] or "未设置")}</code><br>
+{head} · {cl}</div>
+{state}
+{btn}
+<div class="hint">更新走 Valve 官方服务器 (匿名登录, 不碰你的 Steam 账号), 只会补游戏文件,
+<b>不会动 Servers 文件夹里的存档</b>; 本来就最新的话几十秒就完。更新完要重启服务器才生效。
+开服端所在的文件夹路径必须是纯英文, 有中文 steamcmd 会拒绝工作 (Valve 的限制)。
+<span style="color:var(--acc2)">· 不想用这条路</span>: 开服端当初是在 Steam 商店装的,
+直接在「库 → 按工具筛选」里右键它 → 更新也一样。</div></div>"""
 
 
 # ================================================================ 编码
@@ -552,97 +1332,324 @@ SELECTS = [
 ]
 
 # ================================================================ 玩法设置表单 (Config.txt 汉化)
+# 每项: (键, 中文名, 类型, 短提示, 规格(lo, hi, 游戏默认), 详细说明)
+#   规格里的 None = 这一头没有界限; 默认写字符串 "mode" = 由「游戏难度」决定, 不是一个固定数。
+#   范围取的是游戏真正认的数(概率类一律 0~1, 倍率类一律 >=0), 填超了保存会被拦下来。
 GAMEPLAY_FIELDS = [
     ("Players", "玩家", [
-        ("Health_Default", "出生生命值", "number", ""),
-        ("Food_Default", "出生饱食度", "number", "0~100"),
-        ("Water_Default", "出生含水量", "number", "0~100"),
-        ("Armor_Multiplier", "玩家受伤倍率", "number", "0.5=减半 0=无敌"),
-        ("Experience_Multiplier", "经验获取倍率", "number", ""),
-        ("Skill_Cost_Multiplier", "技能升级消耗倍率", "number", ""),
-        ("Can_Hurt_Legs", "摔落伤害", "bool", ""),
-        ("Can_Start_Bleeding", "会流血", "bool", ""),
-        ("Allow_Instakill_Headshots", "狙击爆头一击必杀", "bool", ""),
-        ("Spawn_With_Max_Skills", "出生满技能", "bool", ""),
-        ("Lose_Items_PvP", "PVP死亡掉落物品", "number", "0~1, 0=不掉 1=全掉"),
-        ("Lose_Items_PvE", "PVE死亡掉落物品", "number", "0~1"),
-        ("Lose_Clothes_PvP", "PVP死亡掉落穿戴", "bool", ""),
-        ("Lose_Clothes_PvE", "PVE死亡掉落穿戴", "bool", ""),
-        ("Lose_Weapons_PvP", "PVP死亡掉落武器", "bool", ""),
-        ("Lose_Weapons_PvE", "PVE死亡掉落武器", "bool", ""),
+        ("Health_Default", "出生生命值", "number", "", (1, 1000, 100),
+         "刚进服有多少血。100 是原版; 填 500 就是砍不死的爽服, 填 1 就是被僵尸蹭一下就没。"),
+        ("Food_Default", "出生饱食度", "number", "", (0, 100, "mode"),
+         "刚进服肚子有多饱, 满值 100。0 = 一出生就在饿死边缘, 得马上找吃的。"),
+        ("Water_Default", "出生含水量", "number", "", (0, 100, "mode"),
+         "刚进服有多渴, 满值 100。和饱食度一样, 掉到 0 会开始掉血。"),
+        ("Armor_Multiplier", "玩家受伤倍率", "number", "0=无敌", (0, None, 1),
+         "所有打在你身上的伤害乘多少倍。0 = 完全不掉血(想无敌就填 0), 0.5 = 只吃一半伤害, 2 = 双倍疼。"),
+        ("Experience_Multiplier", "经验获取倍率", "number", "", (0, None, "mode"),
+         "杀僵尸、做动作拿到的经验乘多少倍。填 3~5 半小时技能毕业, 填 0 就永远 0 级。"),
+        ("Skill_Cost_Multiplier", "技能升级消耗倍率", "number", "", (0.1, None, 1),
+         "点一级技能要花多少经验。0.5 = 半价练级; 这一项别填 0, 游戏会算不出等级。"),
+        ("Can_Hurt_Legs", "摔落伤害", "bool", "", (None, None, True),
+         "开 = 从高处跳下来会摔断腿(得等一会儿或者让人扶); 关 = 随便跳楼。"),
+        ("Can_Start_Bleeding", "会流血", "bool", "", (None, None, True),
+         "开 = 被枪、近战、僵尸抓伤之后会持续流血, 必须用绷带止血; 关 = 只掉血不会流血, 新手服建议关。"),
+        ("Allow_Instakill_Headshots", "狙击爆头一击必杀", "bool", "", (None, None, False),
+         "开 = 打中头直接秒人, 不管还剩多少血; 关 = 爆头只是伤害高一些。PVP 服开了会非常劝退。"),
+        ("Spawn_With_Max_Skills", "出生满技能", "bool", "", (None, None, False),
+         "开 = 一出生所有技能直接满级, 完全不用练。和「经验倍率」同时开的话这个更省事。"),
+        ("Lose_Items_PvP", "PVP死亡掉落物品", "number", "0~1", (0, 1, 0),
+         "被人打死时背包掉多少。0 = 一件不掉, 1 = 全掉地上, 0.5 = 随机掉一半。只在 PVP 打架时生效。"),
+        ("Lose_Items_PvE", "PVE死亡掉落物品", "number", "0~1", (0, 1, 0),
+         "被僵尸打死时背包掉多少, 同上。想让服轻松一点就填 0。"),
+        ("Lose_Clothes_PvP", "PVP死亡掉落穿戴", "bool", "", (None, None, False),
+         "开 = 被打死时身上穿的衣服、头盔、背包也会掉出来。"),
+        ("Lose_Clothes_PvE", "PVE死亡掉落穿戴", "bool", "", (None, None, False),
+         "开 = 被僵尸打死时身上穿的装备会掉出来。"),
+        ("Lose_Weapons_PvP", "PVP死亡掉落武器", "bool", "", (None, None, False),
+         "开 = 被打死时手上拿着的那把枪会掉在地上(单独算, 不含背包)。"),
+        ("Lose_Weapons_PvE", "PVE死亡掉落武器", "bool", "", (None, None, False),
+         "开 = 被僵尸打死时手上拿着的枪会掉出来。"),
     ]),
     ("Zombies", "僵尸", [
-        ("Spawn_Chance", "僵尸刷新率", "number", "0~1"),
-        ("Damage_Multiplier", "僵尸伤害倍率", "number", ""),
-        ("Armor_Multiplier", "僵尸承伤倍率", "number", "越低越耐打"),
-        ("Sprinter_Chance", "疾跑僵尸概率", "number", "0~1"),
-        ("Crawler_Chance", "爬行僵尸概率", "number", "0~1"),
-        ("Loot_Chance", "僵尸掉落物品概率", "number", "0~1"),
-        ("Respawn_Day_Time", "僵尸复活时间(秒)", "number", ""),
-        ("Can_Target_Barricades", "僵尸攻击家具", "bool", ""),
-        ("Can_Target_Structures", "僵尸攻击建筑", "bool", ""),
-        ("Can_Target_Vehicles", "僵尸攻击载具", "bool", ""),
+        ("Spawn_Chance", "僵尸刷新率", "number", "0~1", (0, 1, "mode"),
+         "刷新点长出僵尸的概率。0 = 整个世界一只僵尸都没有(纯养老服), 1 = 到处挤满。"),
+        ("Damage_Multiplier", "僵尸伤害倍率", "number", "", (0, None, "mode"),
+         "僵尸打你有多疼。0 = 站着让僵尸咬也不掉血, 2 = 两三口没命。"),
+        ("Armor_Multiplier", "僵尸承伤倍率", "number", "越低越耐打", (0, None, "mode"),
+         "你打僵尸的伤害乘多少倍 —— 这个数字越小僵尸越硬。想两枪一个就填 3, 填 0 僵尸就彻底打不死。"),
+        ("Sprinter_Chance", "疾跑僵尸概率", "number", "0~1", (0, 1, "mode"),
+         "刷出来的僵尸里有多少比例是会全速冲脸的疾跑者。填 0 就没有追着你跑的僵尸了。"),
+        ("Crawler_Chance", "爬行僵尸概率", "number", "0~1", (0, 1, "mode"),
+         "趴在地上、靠近才爬起来的那批僵尸的比例。填 0 就没有这种突然惊吓。"),
+        ("Loot_Chance", "僵尸掉落物品概率", "number", "0~1", (0, 1, "mode"),
+         "僵尸死后身上有东西可捡的概率。1 = 每只都掉, 想要刷物资可以调高。"),
+        ("Respawn_Day_Time", "僵尸复活时间(秒)", "number", "", (1, None, None),
+         "白天的尸体过多少秒重新刷成一只新的。数字越小刷得越快, 基地门口会被刷个不停。"),
+        ("Can_Target_Barricades", "僵尸攻击家具", "bool", "", (None, None, True),
+         "开 = 僵尸会锤你家的门、路障和栏杆; 关 = 僵尸完全不碰家具, 围起来的基地绝对安全。"),
+        ("Can_Target_Structures", "僵尸攻击建筑", "bool", "", (None, None, True),
+         "开 = 僵尸会拆墙拆地板; 关 = 建筑打不动, 不怕僵尸潮。"),
+        ("Can_Target_Vehicles", "僵尸攻击载具", "bool", "", (None, None, True),
+         "开 = 僵尸会砸车, 车停在野外容易被挠坏挠炸。"),
     ]),
     ("Items", "物品", [
-        ("Spawn_Chance", "物品刷新率", "number", "0~1"),
-        ("Respawn_Time", "物品刷新间隔(秒)", "number", ""),
-        ("Despawn_Dropped_Time", "丢在地上的物品消失时间(秒)", "number", ""),
-        ("Has_Durability", "物品耐久损耗", "bool", ""),
+        ("Spawn_Chance", "物品刷新率", "number", "0~1", (0, 1, "mode"),
+         "房子里的物资刷出来的概率, 这就是「抢不抢得到东西」的关键。1 = 每个刷新点都出东西。"),
+        ("Respawn_Time", "物品刷新间隔(秒)", "number", "", (1, None, "mode"),
+         "被你捡空的房子过多少秒重新长出物资。想「跑一圈回来又满了」就填小一点, 50 左右很舒服。"),
+        ("Despawn_Dropped_Time", "丢在地上的物品消失时间(秒)", "number", "", (10, None, None),
+         "扔在地上的东西多少秒之后消失。填太小会出现「刚扔的枪转头就没了」, 建议 600 以上。"),
+        ("Has_Durability", "物品耐久损耗", "bool", "", (None, None, True),
+         "开 = 枪械和武器用久了会磨损坏掉, 得用维修包; 关 = 武器永久不坏, 养老服推荐关。"),
     ]),
     ("Vehicles", "载具", [
-        ("Armor_Multiplier", "载具受伤倍率", "number", "0=无敌"),
-        ("Decay_Time", "载具自然损坏时间(秒)", "number", ""),
-        ("Respawn_Time", "载具爆炸后重刷时间(秒)", "number", ""),
-        ("Has_Battery_Chance", "刷车自带电瓶概率", "number", "0~1"),
-        ("Has_Tire_Chance", "刷车自带轮胎概率", "number", "0~1"),
-        ("Max_Instances_Medium", "刷车上限(中型地图)", "number", ""),
+        ("Armor_Multiplier", "载具受伤倍率", "number", "0=无敌", (0, None, 1),
+         "打在车上的伤害乘多少倍。0 = 车怎么打都不会炸, 3 以上就成了纸糊的, 一枪就爆。"),
+        ("Decay_Time", "载具自然损坏时间(秒)", "number", "", (60, None, None),
+         "车放着不管多久开始自己老化(掉油、掉轮胎)。想要车永远不旧, 填一个很大的数比如 999999999。"),
+        ("Respawn_Time", "载具爆炸后重刷时间(秒)", "number", "", (10, None, None),
+         "车被炸毁之后过多少秒在原刷车点重新刷一辆出来。"),
+        ("Has_Battery_Chance", "刷车自带电瓶概率", "number", "0~1", (0, 1, "mode"),
+         "刷出来的车自带电瓶的概率。填 1 就不用满地图翻电瓶了, 新手会很感谢你。"),
+        ("Has_Tire_Chance", "刷车自带轮胎概率", "number", "0~1", (0, 1, "mode"),
+         "刷出来的车自带轮胎的概率。填 1 = 每辆车下来就能开走。"),
+        ("Max_Instances_Medium", "刷车上限(中型地图)", "number", "", (1, 100, 16),
+         "中型地图(PEI 这类)同一时间路上最多存在多少辆车。越多越热闹, 也更吃服务器性能。"),
     ]),
     ("Barricades", "家具/路障", [
-        ("Decay_Time", "家具自然损坏时间(秒)", "number", ""),
-        ("Armor_Lowtier_Multiplier", "低级家具承伤倍率", "number", "0=无敌"),
-        ("Armor_Hightier_Multiplier", "高级家具承伤倍率", "number", ""),
-        ("Melee_Damage_Multiplier", "近战对家具伤害倍率", "number", ""),
+        ("Decay_Time", "家具自然损坏时间(秒)", "number", "", (60, None, None),
+         "家具路障放着不管多久开始老化损坏。填很大的数基本就等于永远不会坏。"),
+        ("Armor_Lowtier_Multiplier", "低级家具承伤倍率", "number", "0=无敌", (0, None, 1),
+         "木门、铁丝网这类低级家具的承伤倍率。0 = 怎么砸都不坏。"),
+        ("Armor_Hightier_Multiplier", "高级家具承伤倍率", "number", "", (0, None, 0.5),
+         "铁柜、水泥这一类的承伤倍率, 原版默认 0.5(比低级家具更耐打)。数字越小越硬。"),
+        ("Melee_Damage_Multiplier", "近战对家具伤害倍率", "number", "", (0, None, 1),
+         "拿冷兵器砸家具的伤害乘多少倍。0 = 砍不坏别人家, 想防砍家可以调这个而不是把家具设成无敌。"),
     ]),
     ("Structures", "建筑", [
-        ("Decay_Time", "建筑自然损坏时间(秒)", "number", ""),
-        ("Armor_Lowtier_Multiplier", "低级建筑承伤倍率", "number", "0=无敌"),
-        ("Armor_Hightier_Multiplier", "高级建筑承伤倍率", "number", ""),
-        ("Melee_Damage_Multiplier", "近战对建筑伤害倍率", "number", ""),
+        ("Decay_Time", "建筑自然损坏时间(秒)", "number", "", (60, None, None),
+         "玩家盖的建筑多久开始老化。留太长会出现一堆没人玩的破房子占着地图。"),
+        ("Armor_Lowtier_Multiplier", "低级建筑承伤倍率", "number", "0=无敌", (0, None, 1),
+         "木墙木地板这类低级墙的承伤倍率。0 = 拆不掉。"),
+        ("Armor_Hightier_Multiplier", "高级建筑承伤倍率", "number", "", (0, None, 0.5),
+         "水泥、金属墙这类高级墙的承伤倍率, 原版默认 0.5。想防抄家就调小, 别调成 0。"),
+        ("Melee_Damage_Multiplier", "近战对建筑伤害倍率", "number", "", (0, None, 1),
+         "冷兵器拆墙的伤害乘多少倍。0 = 只能靠枪和爆炸物拆家。"),
     ]),
     ("Gameplay", "玩法规则", [
-        ("Hitmarkers", "命中标记", "bool", "打中人出现白叉"),
-        ("Crosshair", "显示准星", "bool", ""),
-        ("Chart", "常驻纸质地图", "bool", "不用捡地图物品"),
-        ("Satellite", "常驻卫星地图", "bool", ""),
-        ("Compass", "常驻指南针", "bool", ""),
-        ("Group_Map", "队友显示在地图上", "bool", ""),
-        ("Group_HUD", "队友名字透视", "bool", ""),
-        ("Friendly_Fire", "组队友伤", "bool", ""),
-        ("Can_Suicide", "允许自杀按钮", "bool", ""),
-        ("Timer_Respawn", "死亡后重生等待(秒)", "number", ""),
-        ("Timer_Home", "回床等待(秒)", "number", ""),
-        ("Timer_Exit", "退出服务器等待(秒)", "number", ""),
-        ("Bypass_Building_In_Safezones", "允许安全区内建造", "bool", ""),
-        ("Allow_Shoulder_Camera", "第三人称越肩视角", "bool", ""),
+        ("Hitmarkers", "命中标记", "bool", "打中人出现白叉", (None, None, True),
+         "开 = 打中人的瞬间屏幕中间出现白叉, 告诉你「这枪打到了」。新手很有用, 硬核服会关。"),
+        ("Crosshair", "显示准星", "bool", "", (None, None, True),
+         "开 = 屏幕上一直有个准星; 关 = 只能靠机瞄或者拉栓感觉, 老玩家喜欢。"),
+        ("Chart", "常驻纸质地图", "bool", "不用捡地图物品", (None, None, True),
+         "开 = 玩家一直带着手绘地图, 不用去捡地图物品。和下面的卫星地图是两张不同的图。"),
+        ("Satellite", "常驻卫星地图", "bool", "", (None, None, True),
+         "开 = 一直有卫星地图(看得清地形和建筑)。想省事就 Chart 和这个一起开。"),
+        ("Compass", "常驻指南针", "bool", "", (None, None, True),
+         "开 = 右上角一直有指南针。想关掉请直接用「一键设置」里的免指南针开关。"),
+        ("Group_Map", "队友显示在地图上", "bool", "", (None, None, True),
+         "开 = 组队时队友的小圆点会显示在地图上, 走散了能找到人。"),
+        ("Group_HUD", "队友名字透视", "bool", "", (None, None, True),
+         "开 = 队友名字隔着墙也看得见。PVE 合作很有用; PVP 服别开, 这等于给队友开透视。"),
+        ("Friendly_Fire", "组队友伤", "bool", "", (None, None, False),
+         "开 = 打队友会真的扣队友的血; 关 = 误伤自己人没伤害, 人多的小队建议关。"),
+        ("Can_Suicide", "允许自杀按钮", "bool", "", (None, None, True),
+         "开 = 玩家菜单里有自杀选项。卡进地形、掉下悬崖出不来时全靠它, 关掉容易收到投诉。"),
+        ("Timer_Respawn", "死亡后重生等待(秒)", "number", "", (0, 300, 0),
+         "死了之后要站多少秒才能点重生。0 = 立刻重生; 想硬核一点填 20~30。"),
+        ("Timer_Home", "回床等待(秒)", "number", "", (0, 600, 60),
+         "按 /home 回家之前要站住不动多少秒。中途被打就重新计时, 防止打架时秒回家。"),
+        ("Timer_Exit", "退出服务器等待(秒)", "number", "", (0, 600, 20),
+         "玩家点退出时要停留多少秒, 避免手滑退出去。"),
+        ("Bypass_Building_In_Safezones", "允许安全区内建造", "bool", "", (None, None, False),
+         "开 = 在加油站、城市中心这些安全区也能放家具盖建筑。原版不允许, 开了会出现堵门房。"),
+        ("Allow_Shoulder_Camera", "第三人称越肩视角", "bool", "", (None, None, True),
+         "开 = 第三人称可以切到越肩视角(手感接近第一人称); 关 = 只能是身后拉远视角。"),
     ]),
     ("Events", "事件", [
-        ("Use_Airdrops", "开启空投", "bool", ""),
-        ("Airdrop_Frequency_Min", "空投最小间隔(天)", "number", ""),
-        ("Airdrop_Frequency_Max", "空投最大间隔(天)", "number", ""),
-        ("Weather_Duration_Multiplier", "天气时长倍率", "number", "0=关闭天气"),
-        ("Arena_Min_Players", "竞技场最少队伍数", "number", ""),
+        ("Use_Airdrops", "开启空投", "bool", "", (None, None, True),
+         "开 = 空投会按时掉下来。养老服、不想让玩家抢空投打架可以关。"),
+        ("Airdrop_Frequency_Min", "空投间隔倍率(最小)", "number", "是倍率不是天数", (0.1, None, 1),
+         "空投间隔的倍率, 不是天数 —— 1 = 原版节奏, 0.5 = 空投来得更勤一倍, 3 = 很久才来一次。"),
+        ("Airdrop_Frequency_Max", "空投间隔倍率(最大)", "number", "要 ≥ 最小值", (0.1, None, 1),
+         "间隔在最小和最大之间随机取。这一项必须大于等于上面的最小值, 不然游戏会取不到数。"),
+        ("Weather_Duration_Multiplier", "天气时长倍率", "number", "0=关闭天气", (0, None, 1),
+         "一场雷雨、浓雾持续多久。0 = 天气系统不再来, 1 = 原版, 想天天起雾就填大。"),
+        ("Arena_Min_Players", "竞技场最少队伍数", "number", "", (1, 32, 2),
+         "竞技场活动要凑够几队才会开始。不开竞技场就不用管这一项。"),
     ]),
     ("Server", "网络/安全", [
-        ("Max_Ping_Milliseconds", "高延迟踢出(毫秒)", "number", "默认750"),
-        ("Timeout_Game_Seconds", "无响应踢出(秒)", "number", ""),
-        ("VAC_Secure", "VAC 反作弊", "bool", ""),
-        ("BattlEye_Secure", "BattlEye 反作弊", "bool", "不建议关闭"),
+        ("Max_Ping_Milliseconds", "高延迟踢出(毫秒)", "number", "默认750", (100, 5000, 750),
+         "玩家延迟超过多少毫秒就请他出去。原版 750 对国内联机太狠了, 建议 1500~2000, 不然朋友进不来。"),
+        ("Timeout_Game_Seconds", "无响应踢出(秒)", "number", "", (1, 600, 20),
+         "客户端多久不回话就判定掉线踢出。网络不稳可以把这一项调大一点, 太小会频繁被踢。"),
+        ("VAC_Secure", "VAC 反作弊", "bool", "", (None, None, True),
+         "开 = 走 Steam 的 VAC 反作弊。关掉等于欢迎开挂的进来, 不建议动。"),
+        ("BattlEye_Secure", "BattlEye 反作弊", "bool", "不建议关闭", (None, None, True),
+         "开 = 走 BattlEye 服务端反作弊。关了挂哥会变多, 只有排查误封时才临时关一下。"),
     ]),
 ]
 
+# ================================================================ 三档难度的原版默认值
+# 换 mode 时游戏就是整套替换这批默认值, 数值来自游戏自己的难度配置表 (Easy / Normal / Hard)。
+# 只列「玩法设置」页面里能单独改的项, 这样每一项都能标出「你已经手动填过 -> 换难度不再动它」。
+DIFF_ROWS = [
+    ("Items", "Spawn_Chance", "物资刷新率 (屋子里东西的多少)", "pct", .35, .35, .15),
+    ("Items", "Respawn_Time", "物资刷新间隔 (捡空了多久刷回来)", "sec", 50, 100, 150),
+    ("Items", "Has_Durability", "物品会用坏 (耐久损耗)", "bool", False, True, True),
+    ("Zombies", "Spawn_Chance", "僵尸刷新率", "pct", .2, .25, .3),
+    ("Zombies", "Damage_Multiplier", "僵尸打你多疼", "x", .75, 1, 1.5),
+    ("Zombies", "Armor_Multiplier", "僵尸有多耐打 (越低越难打死)", "x", 1.25, 1, .75),
+    ("Zombies", "Loot_Chance", "僵尸身上掉东西的概率", "pct", .55, .5, .3),
+    ("Zombies", "Sprinter_Chance", "疾跑僵尸出现的概率", "pct", 0, .15, .175),
+    ("Zombies", "Crawler_Chance", "爬行僵尸出现的概率", "pct", 0, .15, .125),
+    ("Vehicles", "Has_Battery_Chance", "刷出来的车自带电瓶的概率", "pct", 1, .8, .25),
+    ("Vehicles", "Has_Tire_Chance", "刷出来的车自带轮胎的概率", "pct", 1, .85, .7),
+    ("Players", "Food_Default", "出生时饱食度", "num", 100, 100, 85),
+    ("Players", "Water_Default", "出生时含水量", "num", 100, 100, 85),
+    ("Players", "Experience_Multiplier", "经验获取倍率", "x", 1.5, 1, 1.5),
+    ("Players", "Can_Hurt_Legs", "摔落会摔断腿", "bool", False, True, True),
+    ("Players", "Can_Start_Bleeding", "会流血", "bool", False, True, True),
+    ("Players", "Allow_Instakill_Headshots", "爆头一击必杀", "bool", False, False, True),
+    ("Gameplay", "Hitmarkers", "打中人出现命中标记", "bool", True, True, False),
+    ("Gameplay", "Crosshair", "屏幕准星", "bool", True, True, False),
+    ("Gameplay", "Chart", "常驻地图 (不用捡地图)", "bool", True, False, False),
+]
+
+MODE_LABELS = {"easy": "🟢 简单", "normal": "🟡 普通", "hard": "🔴 困难"}
+MODE_COLS = ("easy", "normal", "hard")
+
+
+def diff_fmt(kind, v):
+    if kind == "bool":
+        return "✔ 开" if v else "✘ 关"
+    v = float(v)
+    if kind == "pct":
+        return "%g%%" % round(v * 100, 1)
+    if kind == "x":
+        return "×%g" % v
+    if kind == "sec":
+        return "%g 秒" % v
+    return "%g" % v
+
+
+def difficulty_overrides():
+    """当前存档 Config.txt 里已经被手动改过的难度项 -> 'Section|Key': 值"""
+    out = {}
+    try:
+        path = config_txt()
+    except OSError:
+        return out
+    if not os.path.isfile(path):
+        return out
+    for sec, key, *_rest in DIFF_ROWS:
+        try:
+            val = get_cfg(path, sec, key)
+        except OSError:
+            val = None
+        if val is not None and str(val).strip() != "":
+            out[f"{sec}|{key}"] = val
+    return out
+
+
+def difficulty_rows_html(pinned=None, only=None):
+    """难度对照表; only=(a,b) 时只列这两档之间有差异的行"""
+    pinned = pinned or {}
+    ai = MODE_COLS.index(only[0]) if only and only[0] in MODE_COLS else -1
+    bi = MODE_COLS.index(only[1]) if only and only[1] in MODE_COLS else -1
+    cols = MODE_COLS if only is None else tuple(only)
+    rows = ""
+    for sec, key, cn, kind, *vals in DIFF_ROWS:
+        if only is not None and vals[ai] == vals[bi]:
+            continue
+        cells = "".join(f"<td>{esc(diff_fmt(kind, vals[MODE_COLS.index(c)]))}</td>" for c in cols)
+        tag = ""
+        if f"{sec}|{key}" in pinned:
+            tag = (f'<span class="pin">已手动设为 {esc(str(pinned[f"{sec}|{key}"]))}</span>')
+        rows += (f'<tr><td>{esc(cn)}{tag}</td>{cells}</tr>')
+    if not rows:
+        return '<div class="hint">这两档之间没有数值差异。</div>'
+    head = "".join(f"<th>{esc(MODE_LABELS.get(c, c))}</th>" for c in cols)
+    return (f'<table class="difft"><thead><tr><th class="l">会变的数值</th>{head}</tr></thead>'
+            f'<tbody>{rows}</tbody></table>')
+
+
+# ================================================================ 玩法参数规格 (表单提示 + 保存校验)
+DIFF_BY_KEY = {f"{sec}|{key}": (kind, e, n, h) for sec, key, _cn, kind, e, n, h in DIFF_ROWS}
+CFG_SPECS = {}
+
+for _sec, _sec_cn, _fields in GAMEPLAY_FIELDS:
+    for _f in _fields:
+        CFG_SPECS[f"{_sec}|{_f[0]}"] = {"dk": f"{_sec}|{_f[0]}", "label": _f[1],
+                                        "sec_cn": _sec_cn, "type": _f[2],
+                                        "lo": _f[4][0], "hi": _f[4][1], "def": _f[4][2]}
+
+
+def num_out(v):
+    v = float(v)
+    return str(int(v)) if v == int(v) else ("%g" % v)
+
+
+def default_text(spec):
+    """游戏默认值怎么说: 定值 / 随难度 / 没有依据就不说"""
+    d = spec["def"]
+    if d == "mode":
+        got = DIFF_BY_KEY.get(spec["dk"])
+        if not got:
+            return "默认值随「游戏难度」变化"
+        kind, e, n, h = got
+        return (f"默认随难度: 简单 {diff_fmt(kind, e)} · 普通 {diff_fmt(kind, n)} · "
+                f"困难 {diff_fmt(kind, h)}")
+    if d is None:
+        return ""
+    if spec["type"] == "bool":
+        return f"游戏默认: {'开' if d else '关'}"
+    return f"游戏默认 {num_out(d)}"
+
+
+def spec_text(spec):
+    if spec["type"] == "bool":
+        return default_text(spec)
+    lo, hi = spec["lo"], spec["hi"]
+    if lo is not None and hi is not None:
+        rng = f"可以填 {num_out(lo)} ~ {num_out(hi)}"
+    elif lo is not None:
+        rng = f"最小 {num_out(lo)}"
+    elif hi is not None:
+        rng = f"最大 {num_out(hi)}"
+    else:
+        rng = ""
+    return " · ".join(x for x in (rng, default_text(spec)) if x)
+
+
+def gameplay_check(dk, raw):
+    """保存前逐项体检: 返回 (要写入的值或 None, 报错文字)。报错文字非空 = 整次保存作废。"""
+    sp = CFG_SPECS.get(dk)
+    if not sp:
+        return None, "不认识的配置项"
+    name = f"{sp['sec_cn']} · {sp['label']}"
+    s = str(raw).strip()
+    if s == "":
+        return None, ""                       # 留空 = 恢复游戏默认
+    if sp["type"] == "bool":
+        low = s.lower()
+        if low not in ("true", "false"):
+            return None, f"{name} 只能选 开 / 关 / 默认"
+        return low.capitalize(), ""
+    try:
+        v = float(s.replace(",", "").replace("，", ""))
+    except ValueError:
+        return None, f"{name} 要填数字, 现在填的是「{s[:16]}」"
+    lo, hi = sp["lo"], sp["hi"]
+    if lo is not None and v < lo:
+        return None, f"{name} 最小是 {num_out(lo)} (你填了 {num_out(v)})"
+    if hi is not None and v > hi:
+        return None, f"{name} 最大是 {num_out(hi)} (你填了 {num_out(v)})"
+    return num_out(v), ""
+
+
 # ---- 新建存档时生成的配置文件 ----
 ALL_CFG_KEYS = {}
-
 
 def _collect_cfg_key(sec, key):
     ALL_CFG_KEYS.setdefault(sec, [])
@@ -1212,6 +2219,9 @@ def start_server():
     if running:
         return False, "服务器已经在运行了"
     if not setup_done():
+        err = bound_dir_error()
+        if err:
+            return False, err
         return False, "请先完成开服器初始设置 (游戏目录 / 存档)"
     warn = map_warning()
     patch_rcon()   # 临时启用 RCON, 用于控制台发命令与安全关服
@@ -2263,6 +3273,30 @@ tr:hover td{background:var(--hov)}
 a{color:var(--acc2);text-decoration:none}
 a.btn{color:#fff}
 .hint{color:var(--sub);font-size:12px;margin-top:6px}
+.hint.ok{color:var(--ok)}.hint.err{color:var(--bad)}
+/* 玩法设置: 数值规格 + 详细说明 */
+.sp{font-size:11.5px;color:var(--acc2);margin:6px 0 0;line-height:1.6}
+.det{font-size:12px;color:var(--sub);margin:3px 0 0;line-height:1.7}
+.gperr{font-size:11.5px;color:var(--bad);margin:4px 0 0;min-height:0}
+/* steamcmd 进度条 (初始设置下载 / 服务器设置更新 共用) */
+.bar{height:9px;border-radius:999px;background:var(--line);overflow:hidden;margin:12px 0 6px}
+.bar i{display:block;height:100%;width:0;border-radius:999px;transition:width .6s;
+background:linear-gradient(90deg,#38bdf8,#8b5cf6,#38bdf8);background-size:200% 100%;
+animation:flow 2.4s linear infinite}
+@keyframes flow{to{background-position:200% 0}}
+.dllog{max-height:132px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:9px;
+padding:9px 11px;font:11.5px/1.7 Consolas,monospace;color:var(--sub);white-space:pre-wrap;
+word-break:break-all;margin:8px 0 0}
+/* 难度对照表 */
+.difbox{margin-top:8px;border:1px solid var(--line);border-radius:10px;padding:9px 12px;background:var(--bg)}
+.difbox summary{cursor:pointer;font-size:13px;color:var(--acc2);font-weight:600;outline:0}
+.difft{width:100%;border-collapse:collapse;margin:6px 0 2px;font-size:12.5px}
+.difft th,.difft td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)}
+.difft th{color:var(--sub);font-weight:600;white-space:nowrap}
+.difft td+td,.difft th+th{white-space:nowrap;font-variant-numeric:tabular-nums}
+.difft tbody tr:last-child td{border-bottom:none}
+.pin{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:999px;
+background:rgba(245,158,11,.14);color:#f59e0b;font-size:11px}
 .sep{height:1px;background:var(--line);margin:14px 0}
 /* 白天/黑夜切换开关 (Uiverse.io by RiccardoRapelli) */
 .switch{position:relative;display:inline-block;width:60px;height:34px;flex:none;cursor:pointer}
@@ -2531,9 +3565,11 @@ body:JSON.stringify(body||{})}).then(r=>{
 /* ---- 玻璃拟态弹窗: 返回 Promise(true=确认/false=取消) ---- */
 function modal(o){return new Promise(function(res){
  var m=document.createElement('div');m.className='mask';
- var box=document.createElement('div');box.className='modal-box';
+ var box=document.createElement('div');box.className='modal-box'+(o.wide?' wide':'');
  var h=document.createElement('h3');h.textContent=(o.icon?o.icon+'  ':'')+(o.title||'');
- var bd=document.createElement('div');bd.className='mbd';bd.textContent=o.body||'';
+ var bd=document.createElement('div');bd.className='mbd';
+ if(o.html){bd.style.whiteSpace='normal';bd.innerHTML=o.html;}
+ else bd.textContent=o.body||'';
  var bt=document.createElement('div');bt.className='mbtns';
  var no=document.createElement('button');no.className='btn gray';no.textContent=o.noText||'忽略';
  var okb=document.createElement('button');okb.className='btn'+(o.danger?' red':'');okb.textContent=o.okText||'确定';
@@ -2569,7 +3605,8 @@ function pick(o){return new Promise(function(res){
 var CREDITS=[
  ['💻','Pippl','Dawn Sharkk 作者 · 界面 / 功能 / 文档','作者'],
  ['🧪','Nmaomao','功能测试','测试'],
- ['🪟','爱情是件奢侈品','Windows 11 适配测试','测试']];
+ ['🪟','爱情是件奢侈品','Windows 11 适配测试','测试'],
+ ['🎨','B站大禹只影','头像设计','头像']];
 function showCredits(){
  if(document.querySelector('.mask[data-cred]'))return;
  var m=document.createElement('div');m.className='mask';m.setAttribute('data-cred','1');
@@ -2587,7 +3624,7 @@ function showCredits(){
   r.appendChild(av);r.appendChild(tx);r.appendChild(bg);bd.appendChild(r);});
  var th=document.createElement('div');th.className='cthanks';
  th.textContent='感谢 Nmaomao 与 爱情是件奢侈品 两位测试员的帮助 —— 一个个坑都是他们踩出来的, '+
-  'Dawn Sharkk 才有今天这个稳定度。';
+  'Dawn Sharkk 才有今天这个稳定度。也谢谢 B站大禹只影 为项目画的这张鲨鱼头像。';
  var bt=document.createElement('div');bt.className='mbtns';
  var okb=document.createElement('button');okb.className='btn';okb.textContent='知道啦';
  bt.appendChild(okb);
@@ -2853,7 +3890,7 @@ if(t)localStorage.setItem('untheme',t);}}catch(e){{}}</script>
 <aside class="side">
   <div class="logo"><img class="logo-img" src="/logo.png" style="width:58px;height:58px" alt="Dawn Sharkk">
   <div><b>Dawn Sharkk</b>
-  <div class="sub">Unturned 开服器 v{VERSION} · by Pippl</div></div></div>
+  <div class="sub">Unturned 开服器 {VER_LABEL} · by Pippl</div></div></div>
   <nav class="nav">{links}</nav>
   <div class="foot">{foot}</div>
 </aside>
@@ -3070,6 +4107,7 @@ def page_commands():
     lc = get_launch_cfg()
     close_stop = bool(_settings.get("close_bat_stops_server"))
     rocket_ok = rocket_installed()
+    ver_card = dedi_version_card()
     rocket_note = "· 检测到 Modules\\Rocket.Unturned" if rocket_ok else "· 不安装的话 Rocket 插件不会加载"
     text, _ = read_file(commands_path())
     entries = parse_commands(text)
@@ -3080,16 +4118,30 @@ def page_commands():
             vals[e["key"].lower()] = e["value"]
     cur_pvpve = "pvp" if "pvp" in vals else ("pve" if "pve" in vals else "")
 
-    def pills(key, options, cur=None):
+    def pills(key, options, cur=None, onchange=""):
         if cur is None:
             cur = vals.get(key, "")
         p = ""
         for v, label in options:
             on = "checked" if cur == v else ""
-            p += f'<label><input type="radio" name="p_{key}" value="{v}" {on}><span>{label}</span></label>'
+            p += (f'<label><input type="radio" name="p_{key}" value="{v}" {on}{onchange}>'
+                  f'<span>{label}</span></label>')
         return p
 
-    mode_pills = pills("mode", [("easy", "🟢 简单"), ("normal", "🟡 普通"), ("hard", "🔴 困难")])
+    mode_cur = (vals.get("mode") or "normal").strip().lower()
+    if mode_cur not in MODE_COLS:
+        mode_cur = "normal"
+    mode_pills = pills("mode", [("easy", "🟢 简单"), ("normal", "🟡 普通"), ("hard", "🔴 困难")],
+                       cur=mode_cur, onchange=' onchange="askMode(this)"')
+    pinned = difficulty_overrides()
+    diff_full = difficulty_rows_html(pinned=pinned)
+    mode_diff = {}
+    for a in MODE_COLS:
+        for b in MODE_COLS:
+            if a != b:
+                mode_diff[f"{a}>{b}"] = {
+                    "from": MODE_LABELS[a], "to": MODE_LABELS[b],
+                    "table": difficulty_rows_html(pinned=pinned, only=(a, b))}
     persp_pills = pills("perspective", [("first", "仅第一人称"), ("third", "仅第三人称"),
                                         ("both", "都可以 (推荐)"), ("vehicle", "载具内第三人称")])
     pvpve = pills("pvpve", [("pvp", "⚔️ PVP 玩家对战"), ("pve", "🧟 PVE 只打僵尸")])
@@ -3181,7 +4233,12 @@ def page_commands():
 <div><label class="f"><b>对战模式</b><code class="k">PVP / PVE</code></label>
 <div class="pills">{pvpve}</div></div>
 <div><label class="f"><b>游戏难度</b><code class="k">mode</code></label>
-<div class="pills">{mode_pills}</div></div>
+<div class="pills">{mode_pills}</div>
+<details class="difbox"><summary>📊 三档难度到底差在哪 (点开看全部 {len(DIFF_ROWS)} 项)</summary>
+<div class="hint">下面是游戏自己的原版默认值。<b>换难度 = 整套换掉这些默认值</b>,
+不是只换个名字。橙色标记的项表示你在「玩法设置」里单独填过数值,
+那一项<b>以你填的为准</b>, 换难度不会再动它。</div>
+{diff_full}</details></div>
 <div><label class="f"><b>允许的视角</b><code class="k">perspective</code></label>
 <div class="pills">{persp_pills}</div></div>
 <div><label class="f"><b>开启作弊</b><code class="k">cheats on</code></label>
@@ -3223,6 +4280,7 @@ def page_commands():
 <div style="margin-top:12px"><button class="btn" onclick="saveLaunch()">保存启动参数</button>
 <span class="hint" style="margin-left:10px">重启服务器后生效</span></div>
 </div>
+{ver_card}
 <div class="card"><h2>Rocket 插件框架</h2>
 <div class="desc">Rocket 让服务器可以加载插件(.dll)。当前状态:
 <b style="color:{'var(--ok)' if rocket_ok else 'var(--bad)'}">{'已安装' if rocket_ok else '未安装'}</b>
@@ -3241,7 +4299,8 @@ def page_commands():
 <span class="hint" style="margin-left:12px">保存后需要重启服务器才会生效 —— 改过没保存就切页或开服, 会弹框提醒并帮你直接保存</span></div>
 {browser_card}
 """
-    script = """
+    script = DL_CORE_JS + "\nvar MODE_CUR=" + json.dumps(mode_cur) + ";" + \
+        "var MODE_DIFF=" + json.dumps(mode_diff, ensure_ascii=False) + ";" + """
 function mapVal(){
  var c=document.getElementById('i_map_custom').value.trim();
  return c||document.getElementById('i_map').value.trim();}
@@ -3268,6 +4327,7 @@ function save(){
  if(bad){toast('✘ '+bad,1);return;}
  return post('/api/commands',{kv:kv}).then(r=>{
   if(!r.ok){toast('✘ '+(r.msg||'保存失败'),1);return;}
+  var m=document.querySelector('input[name=p_mode]:checked');if(m)MODE_CUR=m.value;
   if(window.dirtySaved)dirtySaved('[data-grp=cmd]');
   toast(r.warn?('⚠ 已保存, 但'+r.warn):'✔ 已保存! 重启服务器后生效',r.warn?1:0);});}
 async function saveLaunch(){
@@ -3308,6 +4368,27 @@ function clearBr(){['bi_icon','bi_thumb','bi_links'].forEach(function(id){
  document.getElementById(id).value='';});
  if(window.dirtyCheck)dirtyCheck();
  toast('输入框已清空 — 点保存即恢复游戏默认(不显示图标)');}
+/* ---- 换难度: 把这一档与上一档的数值差异摆到眼前再确认 ---- */
+function modeRadio(m){return document.querySelector('input[name=p_mode][value="'+m+'"]');}
+async function askMode(el){
+ var to=el.value, from=MODE_CUR;
+ if(to===from)return;
+ var d=MODE_DIFF[from+'>'+to];
+ if(!d){MODE_CUR=to;return;}
+ var note='以上是游戏原版的默认值, 换难度不会重建世界, 也不会动你已有的存档建筑。'+
+          '带橙色标记的项你已经在「玩法设置」里单独填过, 那一项仍然以你填的为准。'+
+          '选完记得点「保存修改」并重启服务器。';
+ var go=await modal({icon:'⚖️',title:(d.from+' → '+d.to)+': 会改变这些数值',
+  html:d.table+'<div class="hint" style="margin-top:12px;line-height:1.8">'+note+'</div>',
+  okText:'✔ 就换成这个',noText:'↩ 不换回去了',wide:true});
+ if(go){MODE_CUR=to;toast('难度改成了'+d.to+', 点下面的「保存修改」才会真的写进 Commands.dat');}
+ else{var back=modeRadio(from);if(back)back.checked=true;}
+ if(window.dirtyCheck)dirtyCheck();}
+/* 进度恢复: 页面重开/刷新时, steamcmd 还在跑就接着显示进度条 */
+(function(){dlGet().then(function(s){
+ if(!s||!s.state)return;
+ if(s.state==='running'){dlVis('dlbar','block');dlDraw(s);dlPoll();}
+ else if(s.state==='error'||s.state==='cancelled')dlDraw(s);});})();
 /* 防呆登记: 这三块各有自己的保存按钮 */
 var DIRTY_GROUPS=[
  {sel:'[data-grp=cmd]',name:'基础信息与游戏方式',save:save,fix:showMap},
@@ -3322,9 +4403,13 @@ def page_gameplay():
     sections_html = ""
     for sec, sec_cn, fields in GAMEPLAY_FIELDS:
         rows = ""
-        for key, label, typ, hint in fields:
+        for key, label, typ, hint, spec, detail in fields:
+            sp = CFG_SPECS[f"{sec}|{key}"]
             fid = f"g_{sec}|{key}"
             val = get_cfg(config_txt(), sec, key)
+            note = spec_text(sp)
+            note_html = f'<div class="sp">{esc(note)}</div>' if note else ""
+            det_html = f'<div class="det">{esc(detail)}</div>' if detail else ""
             if typ == "bool":
                 cur_true = val is not None and val.lower() == "true"
                 cur_false = val is not None and val.lower() == "false"
@@ -3334,17 +4419,28 @@ def page_gameplay():
 <label><input type="radio" name="{fid}" value="" {'checked' if val is None else ''}><span>默认</span></label>
 </div>"""
             else:
-                inp = (f'<input class="f" type="text" id="{esc(fid)}" value="{esc(val or "")}">'
-                       f'<div class="hint">留空 = 使用游戏默认值</div>')
-            rows += f"""<div><label class="f"><b>{label}</b><code class="k">{key}</code></label>{inp}</div>"""
+                attrs = ""
+                if sp["lo"] is not None:
+                    attrs += f' data-lo="{num_out(sp["lo"])}"'
+                if sp["hi"] is not None:
+                    attrs += f' data-hi="{num_out(sp["hi"])}"'
+                inp = (f'<input class="f" type="text" id="{esc(fid)}"{attrs} placeholder="留空 = 游戏默认"'
+                       f' value="{esc(val or "")}" oninput="gpCheck(this)">'
+                       f'<div class="gperr" id="m_{esc(fid)}"></div>')
+            rows += (f'<div><label class="f"><b>{label}</b><code class="k">{sec}/{key}</code></label>'
+                     f'{inp}{note_html}{det_html}</div>')
         sections_html += f"""
 <div class="card" data-grp="game"><h2>{sec_cn} <code class="k">{sec}</code></h2>
 <div class="grid g3">{rows}</div></div>"""
 
     content = f"""
 <div class="card"><h2>玩法参数精细调节</h2>
-<div class="desc">每一项都会写入 <code class="k">Config.txt</code>。数字项留空 = 游戏默认; 改完点下面的保存并重启服务器。
-推荐先去「一键设置」页搞定常用的。</div></div>
+<div class="desc">每一项都会写入当前存档的 <code class="k">Config.txt</code>。
+每个框下面都写了<b>这一项能填多大、游戏原版默认是多少、以及 0 和 1 分别代表什么</b>。
+数字留空或选「默认」= 交回给游戏自己决定 (此时会跟着「服务器设置」里的游戏难度走);
+填了数字就以你填的为准, 换难度也不会再改这一项。改完点下面的保存并重启服务器。
+常用的开关建议先去「一键设置」页搞定。</div>
+<div class="tip">不确定就别填: 填错方向不会毁存档, 点「默认」再保存就能退回原版行为。</div></div>
 {sections_html}
 <div class="card">
 <button class="btn big" onclick="save()">💾 保存全部修改</button>
@@ -3352,16 +4448,33 @@ def page_gameplay():
 <span class="hint" style="margin-left:12px">改过没保存就切页或开服, 会弹框提醒并帮你直接保存</span></div>
 """
     script = """
+function gpCheck(el){
+ var msg=document.getElementById('m_'+el.id), v=el.value.trim();
+ el.style.borderColor='';if(msg)msg.textContent='';
+ if(v==='')return true;
+ if(isNaN(Number(v))){el.style.borderColor='var(--bad)';
+  if(msg)msg.textContent='✘ 这一项要填数字, 现在填的看不懂';return false;}
+ var n=Number(v),lo=el.dataset.lo,hi=el.dataset.hi,txt='';
+ if(lo!==undefined&&n<Number(lo))txt='最小是 '+lo;
+ if(hi!==undefined&&n>Number(hi))txt=(txt?txt+'、':'')+'最大是 '+hi;
+ if(txt){el.style.borderColor='var(--bad)';
+  if(msg)msg.textContent='✘ 超出范围: '+txt+' (你填了 '+n+')';return false;}
+ return true;}
 async function save(){
- var kv={};
+ var kv={},bad=null;
  document.querySelectorAll('input[type=radio][name^=g_]:checked').forEach(el=>{
   var p=el.name.slice(2).split('|');
   kv[p[0]+'|'+p[1]]=el.value===''?null:el.value;});
  document.querySelectorAll('input.f[id^=g_]').forEach(el=>{
+  if(!gpCheck(el)&&!bad)bad=el;
   var p=el.id.slice(2).split('|');
   kv[p[0]+'|'+p[1]]=el.value.trim()===''?null:el.value.trim();});
+ if(bad){bad.focus();toast('有数值超出范围, 已经帮你定位到那一格 (看框下面的红字)',1);return;}
  var r=await post('/api/gameplay',{kv:kv});
  if(r.ok&&window.dirtySaved)dirtySaved('[data-grp=game]');
+ if(!r.ok&&(r.items||[]).length){
+  r.items.forEach(function(k){var el=document.getElementById('g_'+k);if(el)gpCheck(el);});
+  var first=document.getElementById('g_'+r.items[0]);if(first)first.focus();}
  toast(r.ok?'✔ 已保存! 重启服务器后生效 (共 '+r.count+' 项)':'✘ '+r.msg,r.ok?0:1);}
 /* 防呆登记: 整页共用一个保存按钮 */
 var DIRTY_GROUPS=[{sel:'[data-grp=game]',name:'玩法参数',save:save}];
@@ -3899,12 +5012,68 @@ def page_help():
 朋友输入代码无反应/报错时, 先确认你这边服务器显示"运行中", 再让朋友重启 Steam 后重试。</span>
 </div></div>
 
+<div class="card"><h2>⚠️ 别把「游戏本体」当成开服端</h2>
+<div class="desc" style="line-height:2.1">
+Steam 上有两个 Unturned: <b>Unturned</b> 是你平时玩的游戏本体, <b>Unturned - Dedicated Server</b>
+是免费开的专用服务器端 (大家都叫它 U3DS)。两个文件夹里都有 <code class="k">Unturned.exe</code>,
+但<b>只有开服端能开服</b> —— 拿本体开服会在启动时抛
+<code class="k">NullReferenceException at SDG.Unturned.Assets.Update()</code>, 服务器根本起不来,
+还会往本体目录里写一个 Servers 文件夹, 有搞坏游戏文件的风险。<br>
+从 v0.1.10 起开服器会<b>直接拦下这种绑定</b>: 第 1 步选了本体会红字告诉你为什么不行;
+之前已经绑到本体上的, 打开后会退回第 1 步并说明原因。<br>
+<b>在本体里建过存档怎么办</b>: 打开 <code class="k">...common/Unturned/Servers</code>,
+把里面那个存档文件夹整个<b>剪切</b>到开服端的 <code class="k">Servers</code> 目录下,
+重新选一次目录就能接着玩, 建筑和玩家数据都不会丢。</div></div>
+
+<div class="card"><h2>🛒 开服端怎么拿到: 优先用 Steam 商店装</h2>
+<div class="desc" style="line-height:2.1">
+<b>Unturned - Dedicated Server</b> (AppID 1110390) 在 Steam 上是<b>完全免费</b>的, 谁都能点安装,
+不用买、不用激活码、也不要你是会员。走商店这条路最省心: 下载、校验、以后自动更新全交给
+Steam 自己的下载器, <b>不会卡在 0%, 也不用管路径里有没有中文</b>。<br>
+<b>怎么做</b>: 打开「初始设置」第 1 步, 点<b>「🛒 在 Steam 商店打开开服端 (推荐)」</b>
+—— 它只在一个<b>新标签页</b>里打开商店, 你现在这个开服器页面<b>不会跳走</b>, 填好的设置也还在。
+到了商店页点「安装」, 装完回到开服器点「🔄 重新检测本机」, 下拉里直接就能选到它。<br>
+<span class="hint">商店装会占你 Steam 库里的一个「工具」位置 (和玩游戏的本体是两回事, 不会搞混)。
+不想让它进游戏库、或者这台机器没装 Steam 客户端, 再用下面那条备用的 SteamCMD。</span></div></div>
+
+<div class="card"><h2>🔻 备用方案 SteamCMD: 下载/更新失败九成是路径里有中文</h2>
+<div class="desc" style="line-height:2.1">
+商店那条路走不通时才用它 (没装 Steam 客户端、不想让它进游戏库)。黑框里出现下面这两行之一,
+<b>不是网络问题</b>, 加速器帮不上忙 ——<br>
+<code class="k">Fatal Error: %appname% cannot run from a folder path that includes non-English characters</code><br>
+<code class="k">main.cpp (478) : Assertion Failed: Unable to access Steam files due to incompatible path</code><br>
+Valve 的 steamcmd 一开机就检查<b>它自己所在的文件夹</b>和<b>要下载到的文件夹</b>,
+只要路径里出现中文 (或者任何其他非英文字符) 就直接退出, 连 0% 都跑不满。
+桌面上、用户名里带中文都算, 所以 <code class="k">C:\\Users\\小明\\Desktop\\工具\\steamcmd</code> 这种位置一定失败。<br>
+<b>v0.1.11 起开服器自己处理掉了</b>: steamcmd <b>已经自带在完整包里</b> (不用先下那不到 1 MB 的工具),
+位置也会自动挑纯英文的 (例如 <code class="k">D:\\DawnSharkTools\\steamcmd</code>),
+下载位置默认同样避开中文, 你在网页上填了中文路径会当场红字提醒你换。<br>
+· 以前卡在「① 下载官方 SteamCMD」九成就报 <code class="k">The read operation timed out</code>:
+那是下工具的这一步, 和 1.5 GB 开服端无关 —— 现在包里自带, 这一步整个跳过了<br>
+· 报 <code class="k">ERROR! Failed to install app '1110390' (Missing configuration)</code>:
+这是 Steam 一时没把开服端的应用信息递过来, <b>不是你的路径也不是你的网络设置</b> ——
+v0.1.11 起开服器会自己隔几秒重跑, 最多三趟 (实测第二趟就能把 1.8 GB 一路装完), 你不用管<br>
+· 报 <code class="k">No license</code> / 一直卡在下载不动: 这个才是网络问题, 开一下 Steam 加速器再点一次<br>
+· 反复都不行就别跟它耗: 点上面那个「🛒 在 Steam 商店打开开服端 (推荐)」, 让 Steam 自己装一次,
+回到第 1 步点「🔄 重新检测本机」就能选到, <b>一次网都不用再折腾</b><br>
+· 更新完记得重启服务器才生效; 更新<b>不会碰 Servers 里的存档</b>。</div></div>
+
+<div class="card"><h2>⚠️ 朋友进不去: 开服端版本落后于游戏本体</h2>
+<div class="desc" style="line-height:2.1">
+Steam 会自动把你的<b>游戏本体</b>更新到最新, 但<b>开服端不会自己动</b> —— 游戏版本一旦对不上,
+朋友点你的服务器代码就会<b>卡在加载那一格</b>, 或者提示版本不一致。<br>
+现在「服务器设置 → 开服端版本与更新」会直接把两边版本号摆出来对比, 落后了会红字提醒,
+点<b>「检查并更新开服端」</b>就用 steamcmd 补到最新 (走 Valve 官方服务器, 匿名登录, 不碰你的 Steam 账号)。<br>
+<span class="hint">当初是用 Steam 商店装的开服端, 最省心的更新方式是直接在 Steam 库里右键它 → 更新;
+用「🛒 在 Steam 商店打开开服端」那个按钮随时可以跳过去。</span><br>
+· 版本号是从开服端自己写的日志里读的, 所以这个开服端<b>至少完整跑过一次</b>才读得到</div></div>
+
 <div class="card"><h2>每个菜单是干什么的</h2>
 <div class="desc" style="line-height:2.1">
 <b>仪表盘</b> — 开服 / 重启 / 关服, 查看服务器代码和基本信息<br>
 <b>一键设置</b> — 最常用的傻瓜开关: 死亡不掉落、建筑无敌、车辆无敌、僵尸不拆家、摔落伤害、组队友伤、空投、出生满技能、<b>无需指南针/GPS/手绘地图也能看方向和地图</b>; 僵尸强度 / 经验倍率 / 物资丰富度 / 天气; 还有 <b>Rocket 指令反馈汉化</b><br>
-<b>服务器设置</b> — 服务器名称、地图、人数、端口、PVP/PVE、难度、视角、进服密码、<b>开启作弊 (cheats on)</b>; 以及<b>启动参数</b>、<b>Rocket 安装</b>, 页面最底下是 <b>服务器图标与大厅链接 (图床设置)</b><br>
-<b>玩法设置</b> — 进阶参数: 血量、经验、刷怪、刷车、建筑承伤、空投频率、天气等 (每项都有中文说明)<br>
+<b>服务器设置</b> — 服务器名称、地图、人数、端口、PVP/PVE、<b>难度 (换难度会列出到底改了哪些数值)</b>、视角、进服密码、<b>开启作弊 (cheats on)</b>; 以及<b>启动参数</b>、<b>开服端版本检查与一键更新</b>、<b>Rocket 安装</b>, 页面最底下是 <b>服务器图标与大厅链接 (图床设置)</b><br>
+<b>玩法设置</b> — 进阶参数: 血量、经验、刷怪、刷车、建筑承伤、空投频率、天气等。每一项都标了<b>能填的范围、游戏默认值、0 和 1 分别是什么意思</b>, 超出范围的会被拦下来不让保存<br>
 <b>创意工坊</b> — 填模组 ID 自动下载 Steam 创意工坊模组<br>
 <b>存档管理</b> — <b>建筑存档 / 玩家存档</b>的备份与删除 (删除前强制先备份, 位置自己选)<br>
 <b>控制台</b> — 实时日志和报错、发送命令、<b>在线玩家管理</b> (给物品/车辆、传送、踢出；无敌/隐身由玩家自行使用 /god 与 /vanish 指令)、白天/黑夜等快捷指令<br>
@@ -4160,7 +5329,7 @@ border-radius:8px;padding:8px 12px;font-size:12px;margin-top:14px;line-height:1.
 <input class="f" id="pw" placeholder="粘贴或输入密钥" maxlength="32"
  onkeydown="if(event.key==='Enter')doLogin()" autofocus>
 <button class="btn" onclick="doLogin()">登 录</button>
-<div class="keyhint">密钥在启动开服器.bat 的黑色命令框里 (命令框里那行<b>完整网址</b>已自动复制到剪贴板, 直接 Ctrl+V 到地址栏即可自动登录)<br>
+<div class="keyhint">密钥在 DawnSharkk.exe 的黑色命令框里 (命令框里那行<b>完整网址</b>已自动复制到剪贴板, 直接 Ctrl+V 到地址栏即可自动登录)<br>
 注意: 网址自动登录只在开服器启动后 <b>30 分钟</b>内有效, 超时请手动输入密钥; 密钥每次启动开服器都会变化</div>
 </div>
 </div>
@@ -4197,6 +5366,187 @@ syncSwitch();
 </script></body></html>"""
 
 
+# ================================================================ 开服端下载/更新前端
+# DL_CORE_JS = steamcmd 进度组件 (初始设置的下载面板 + 服务器设置的更新卡片都用它)
+# DEDI_JS    = 再加上初始设置页专用的那套 (选目录 / 扫描本机 / 开始下载)
+DL_CORE_JS = r"""
+/* ---- steamcmd 进度组件: 初始设置页的「下载开服端」和服务器设置页的「更新开服端」共用 ----
+   页面上没有对应的块就自动跳过, 所以两个页面可以用同一套轮询代码。 */
+var _dlt=null;
+function dlEl(id){return document.getElementById(id);}
+function dlTxt(id,t,cls){var e=dlEl(id);if(!e)return;if(cls!=null)e.className=cls;e.textContent=t||'';}
+function dlVis(id,v){var e=dlEl(id);if(e)e.style.display=v;}
+function fmtBytes(n){n=Number(n)||0;var u=['B','KB','MB','GB'],i=0;
+ while(n>=1024&&i<3){n/=1024;i++;}
+ return (i?n.toFixed(1):n.toFixed(0))+' '+u[i];}
+async function dlGet(){
+ try{var r=await fetch('/api/serverdedi/status');return await r.json();}catch(e){return null;}}
+function dlPoll(){if(_dlt)clearInterval(_dlt);_dlt=setInterval(dlTick,1000);dlTick();}
+function dlHalt(){if(_dlt){clearInterval(_dlt);_dlt=null;}}
+async function dlTick(){var s=await dlGet();if(s)dlDraw(s);}
+function dlDraw(s){
+ var st=s.state||'idle';
+ if(st==='running')dlVis('dlbox','block');   /* 面板默认收起, 一有任务就自己摊开给人看进度 */
+ if(st==='running'||s.stage)dlVis('dlbar','block');
+ var p=Math.max(0,Math.min(100,Number(s.pct)||0)),f=dlEl('dlfill');
+ if(f)f.style.width=p.toFixed(1)+'%';
+ var line=(s.stage||'等待中')+'   '+p.toFixed(1)+'%';
+ if(s.total)line+='   '+fmtBytes(s.got)+' / '+fmtBytes(s.total);
+ if(s.speed&&st==='running')line+='   '+fmtBytes(s.speed)+'/s';
+ dlTxt('dlstage',(s.detail?(line+'\n'+s.detail):line),null);
+ var lg=(s.log||[]).slice(-9).join('\n'),el=dlEl('dllog');
+ if(lg&&el){el.textContent=lg;el.style.display='block';el.scrollTop=el.scrollHeight;}
+ var run=(st==='running'),g=dlEl('dlgo');
+ if(g){g.style.display=run?'none':'inline-block';g.disabled=false;}
+ dlVis('dlcancel',run?'inline-block':'none');
+ if(st==='done'){
+  dlHalt();dlVis('dlok','flex');dlTxt('dlres',s.result,null);
+  dlTxt('dlmsg',s.msg||'开服端下载完成','hint ok');
+ }else if(st==='error'||st==='cancelled'){
+  dlHalt();dlTxt('dlmsg',s.msg,'hint'+(st==='error'?' err':''));
+ }
+}
+function dlStartReq(url,body){
+ var g=dlEl('dlgo');if(g)g.disabled=true;
+ dlTxt('dlmsg','','hint');dlVis('dlok','none');
+ return post(url,body).then(function(r){
+  if(!r||!r.ok){
+   if(g)g.disabled=false;
+   return r;
+  }
+  dlVis('dlbar','block');dlPoll();return r;});}
+/* 一键更新当前绑定的开服端 (steamcmd 会自己比对 Steam 上的最新构建) */
+async function updateDedi(){
+ var r=await dlStartReq('/api/serverdedi/update',{});
+ if(!r)return;
+ if(r.ok)toast('开始检查了: steamcmd 会先向 Steam 核对最新构建, 本来就最新的话几十秒就完');
+ else{dlTxt('dlmsg',r.msg||'没能开始更新','hint err');toast(r.msg||'没能开始更新',1);}
+}
+async function cancelDl(){
+ var r=await post('/api/serverdedi/cancel',{});
+ toast((r&&r.msg)||'已请求取消',r&&r.ok?0:1);
+ setTimeout(dlTick,700);
+}
+"""
+
+
+DEDI_JS = DL_CORE_JS + r"""
+function openDl(){dlEl('dlbox').style.display='block';dlEl('dldest').focus();}
+/* 非英文字符直接拦下: steamcmd 碰到中文路径是当场 Fatal Error, 不是慢, 是根本不跑 */
+function dlDestCheck(){
+ var e=dlEl('dldest'),m=dlEl('dldestmsg');if(!e||!m)return true;
+ var v=(e.value||'').trim();
+ if(v&&/[^\x20-\x7e]/.test(v)){
+  m.textContent='⚠ 路径里有中文或其他非英文字符, steamcmd 会直接报错退出 (和网速无关)。' +
+                 '换成纯英文的文件夹, 例如 G:\\U3DS';
+  return false;}
+ m.textContent='';return true;}
+async function reScan(){
+ var m=dlEl('scanmsg');m.className='hint';m.textContent='正在重新扫描本机…';
+ var r=await post('/api/serverdedi/scan',{});
+ var f=(r&&r.found)||[];
+ if(f.length){m.textContent='找到 '+f.length+' 个开服端, 正在刷新上面的列表…';
+  setTimeout(function(){location.reload();},800);}
+ else m.textContent='还是没找到 —— 优先点「🛒 在 Steam 商店打开开服端」装一次, ' +
+                    '或点「🔻 用 SteamCMD 下载」, 也可以在上面手动粘贴路径';
+}
+async function usePath(p){
+ if(!p){toast2('还不知道是哪个目录',1);return false;}
+ var r=await post('/api/serverdedi/use',{path:p});
+ if(!r||!r.ok){toast2((r&&r.msg)||'这个目录用不了',1);return false;}
+ toast2('已把开服端设为游戏目录, 正在进入第 2 步…');
+ setTimeout(function(){location.reload();},700);
+ return true;
+}
+function useDl(){return usePath(dlEl('dlres').textContent||dlEl('dldest').value.trim());}
+async function startDl(force){
+ var g=dlEl('dlgo');g.disabled=true;
+ var dest=(dlEl('dldest').value||'').trim();
+ if(!dest){toast2('先填一个下载位置',1);g.disabled=false;return;}
+ if(!dlDestCheck()){toast2('下载位置只能有英文字母和数字, 改一下再点',1);g.disabled=false;return;}
+ dlEl('dlmsg').textContent='';dlEl('dlmsg').className='hint';
+ try{
+  var r=await post('/api/serverdedi/start',{dest:dest,force:!!force});
+  if(!r||!r.ok){
+   var f=(r&&r.exists)||[];
+   if(f.length){
+    var ls=f.map(function(x,i){
+      return (i+1)+'. '+x.path+(x.instances?('   里面已有 '+x.instances+' 个存档'):'');}).join('\n');
+    var c=await pick({icon:'🔎',title:'本机已经有开服端了',
+      body:'点下载之前又查了一遍这台电脑, 找到这些现成的 Unturned 开服端 (U3DS):\n\n'+ls+
+           '\n\n用现成的就行, 不用再下 1.5 GB。确实想要一份新的, 点「仍然下载」。',
+      btns:[{t:'就用第 1 个',v:'use'},{t:'仍然下载',v:'go',cls:'gray'},{t:'先不下了',v:'stay',cls:'gray'}],
+      cancel:'stay'});
+    g.disabled=false;
+    if(c==='use')await usePath(f[0].path);
+    else if(c==='go')await startDl(true);
+    return;
+   }
+   toast2((r&&r.msg)||'没能开始下载',1);g.disabled=false;return;
+  }
+  toast2('开始下载了, 别关这个页面, 进度在下面');
+  dlEl('dlok').style.display='none';dlEl('dlbar').style.display='block';
+  dlPoll();
+ }catch(e){toast2('请求失败: '+e+' (开服器窗口还开着吗?)',1);}
+ g.disabled=false;
+}
+async function cancelDl(){
+ var r=await post('/api/serverdedi/cancel',{});
+ toast2((r&&r.msg)||'已请求取消',r&&r.ok?0:1);
+ setTimeout(dlTick,700);
+}
+function browseDl(){
+ var m=document.createElement('div');m.className='mask';
+ var box=document.createElement('div');box.className='modal-box wide';
+ var h=document.createElement('h3');h.textContent='📂 选一个放开服端的文件夹';
+ var tip=document.createElement('div');tip.className='mbd';
+ tip.textContent='开服端文件会直接铺在你选定的这个文件夹里 (不会删掉里面已有的东西)。' +
+   '建议单独新建一个空的英文文件夹, 例如 G:\\U3DS —— 路径里有中文 steamcmd 会拒绝下载。';
+ var path=document.createElement('div');path.className='dpath';
+ var list=document.createElement('div');list.className='dirlist';
+ var bt=document.createElement('div');bt.className='mbtns';
+ function mk(t,cls){var b=document.createElement('button');b.className=cls;b.textContent=t;
+  bt.appendChild(b);return b;}
+ var up=mk('⬆ 上一级','btn gray'),no=mk('取消','btn gray'),ok=mk('✔ 就放在这里','btn');
+ box.appendChild(h);box.appendChild(tip);box.appendChild(path);box.appendChild(list);box.appendChild(bt);
+ m.appendChild(box);document.body.appendChild(m);
+ var st={cwd:'',parent:''};
+ function show(p){
+  list.textContent='加载中…';
+  post('/api/dirs',{path:p}).then(function(d){
+   list.textContent='';
+   if(!d||!d.ok){list.textContent=(d&&d.msg)||'打不开该文件夹';return;}
+   st={cwd:d.cwd,parent:d.parent};
+   path.textContent=d.cwd?('当前文件夹: '+d.cwd):'先选一个盘:';
+   if(!d.dirs.length){list.textContent='这个里面没有子文件夹 —— 直接点「✔ 就放在这里」选它。';return;}
+   d.dirs.forEach(function(x){
+    var b=document.createElement('button');b.className='ditem';b.textContent='📁 '+x.name;
+    b.onclick=function(){show(x.path);};list.appendChild(b);});});
+ }
+ up.onclick=function(){show(st.parent||'');};
+ no.onclick=function(){m.remove();};
+ ok.onclick=function(){
+  if(!st.cwd){toast('先进入一个文件夹再确定',1);return;}
+  dlEl('dldest').value=st.cwd;dlEl('dldest').focus();dlDestCheck();m.remove();};
+ m.addEventListener('click',function(e){if(e.target===m)m.remove();});
+ show('');
+}
+(function(){
+ var b=dlEl('dlbox');
+ if(!b)return;
+ var s2=dlEl('step2');
+ // 第 2 步已经解锁说明这个开服端正在用了, 就别再把上次「下载完成」的面板弹出来挡路
+ var pending=s2&&s2.style.display!=='block';
+ dlGet().then(function(s){
+  if(!s)return;
+  if(s.state==='running'){b.style.display='block';dlPoll();}
+  else if(s.state==='done'&&pending){b.style.display='block';dlDraw(s);}
+  else if(s.state==='error'||s.state==='cancelled')dlDraw(s);
+ });
+})();
+"""
+
+
 # ================================================================ 初始设置向导 (游戏目录 + 存档)
 SETUP_CSS = """
 body{background:var(--bg);color:var(--txt);font:15px/1.65 "Microsoft YaHei",sans-serif;
@@ -4225,11 +5575,31 @@ label.r input{accent-color:var(--acc)}
 .ok{color:var(--ok)}.err{color:var(--bad)}
 #toast{position:fixed;top:20px;right:20px}
 body label.switch{position:fixed;top:16px;right:18px;z-index:9}
+.dedi{margin-top:16px;border:1px dashed var(--line);border-radius:12px;padding:14px 16px;background:var(--bg)}
+.dedi.warn{border-style:solid;border-color:rgba(248,113,113,.45);box-shadow:0 0 0 3px rgba(248,113,113,.08)}
+.dedi .dt{font-size:14.5px;margin-bottom:6px}
+.dedi .dd{color:var(--sub);font-size:12.5px;line-height:1.85}
+.dedi .dd code{color:var(--acc2)}
+.drow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.drow input.f{flex:1;min-width:240px;margin:0}
+.btn.sm{padding:9px 15px;font-size:13px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.dlbox{margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+.bar{height:9px;border-radius:999px;background:var(--line);overflow:hidden;margin:12px 0 6px}
+.bar i{display:block;height:100%;width:0;border-radius:999px;transition:width .6s;
+background:linear-gradient(90deg,#38bdf8,#8b5cf6,#38bdf8);background-size:200% 100%;
+animation:flow 2.4s linear infinite}
+@keyframes flow{to{background-position:200% 0}}
+.dllog{max-height:132px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:9px;
+padding:9px 11px;font:11.5px/1.7 Consolas,monospace;color:var(--sub);white-space:pre-wrap;
+word-break:break-all;margin:8px 0 0}
 """
 
 
 def page_setup():
-    gdir = game_dir() if game_exe_ok(game_dir()) else None
+    bound = game_dir()
+    bad_dir = check_game_dir(bound) if bound else ""
+    gdir = None if bad_dir else bound
     detected = detect_game_dirs()
     if gdir and os.path.normcase(gdir) not in map(os.path.normcase, detected):
         detected.insert(0, gdir)
@@ -4247,6 +5617,75 @@ def page_setup():
         f'</span><span style="margin-left:auto" class="hint">上次运行 {esc(i["time"])}</span></label>'
         for i in insts)
 
+    # 第 1 步默认只推商店那条路; steamcmd 面板收起来, 点「备用」按钮或真有任务在跑时才摊开
+    has_dedi = bool(gdir or detected)
+    saved_dest = _settings.get("dedi_dest") or ""
+    # steamcmd 只认英文路径, 上次记的中文位置不能再用
+    default_dest = saved_dest if saved_dest and ascii_path(saved_dest) else dedi_default_dest()
+    dest_bad = "" if ascii_path(default_dest) else (
+        "⚠ 这个默认位置的路径里有中文, steamcmd 不肯往里下。点「📂 浏览文件夹」或直接改成一个"
+        "纯英文文件夹, 例如 " + default_dest[:2] + "\\U3DS")
+    dedi_cls = "" if has_dedi else " warn"
+    dedi_title = ("上面列表里没有你要的目录?" if has_dedi else "本机没有检测到 Unturned 开服端")
+    dedi_dd = (
+        "开服用的是 Steam 免费提供的 <code>Unturned - Dedicated Server</code> (大家都叫它 U3DS, "
+        "文件夹里有 Unturned.exe), 跟平时玩游戏的 Unturned 客户端不是同一个东西。"
+        + ("上面这些应该都是, 点一下就填好了; 想要一份全新的, 优先点「🛒 在 Steam 商店打开开服端」装 "
+           "(免费, 走 Steam 自己的下载器最稳), 装完点「🔄 重新检测本机」就能选到; "
+           "不想让它进你的游戏库, 再用备用的「🔻 用 SteamCMD 下载」。"
+           if has_dedi else
+           ("这个版本不带下载功能: 点「🛒 在 Steam 商店打开开服端」→ 在商店页点安装 (免费) → "
+            "装完回到这一页点「🔄 重新检测本机」, 直接选它就行。"
+            if LITE else
+            "最省事的走法: 点「🛒 在 Steam 商店打开开服端」, 在商店页点安装 (免费, 会进你的 Steam 库), "
+            "装完回到这一页点「🔄 重新检测本机」就能选到它。商店那条路走不动 (没装 Steam 客户端、"
+            "不想让它进游戏库) 再用备用的「🔻 用 SteamCMD 下载」—— 开服器自带工具, "
+            "匿名下到你自己挑的英文文件夹, 不登录你的账号、不碰你的游戏库。")))
+    store_btn = ('<a class="btn" href="' + DEDI_STORE_URL +
+                 '" target="_blank" rel="noopener noreferrer" title="在新标签页打开 Steam 商店, '
+                 '这个页面不会跳走">🛒 在 Steam 商店打开开服端 (推荐)</a>')
+    dedi_dl_btn = ("" if LITE else
+                   '<button class="btn gray" onclick="openDl()">🔻 用 SteamCMD 下载 (备用)</button>')
+    dl_html = ("" if LITE else f"""<div class="dlbox" id="dlbox" style="display:none">
+<div class="dd"><b>备用方案</b> (优先还是上面那个商店按钮, Steam 自己的下载器最稳)。
+这条路是让开服器替你下, 不进你的 Steam 库。<br>
+下载位置: 默认放在开服器自己这个文件夹里 (整套绿色便携, 不想要了直接删文件夹),
+也可以「📂 浏览文件夹」选到别的盘。<b>steamcmd 已经自带在包里</b>, 不用先下工具,
+点开始就直接进 1.5 GB 开服端 —— 全程走 Valve 官方服务器, 不登录你的 Steam 账号、不碰你的游戏库;
+下不动就先开个 Steam 加速器再重试。<br>
+<b>位置必须全是英文</b> (字母、数字、- 和 _): Valve 的 steamcmd 一看路径里有中文就直接报错退出,
+和网速无关, 加速器帮不上。</div>
+<div class="drow"><input class="f" id="dldest" value="{esc(default_dest)}" spellcheck="false"
+ placeholder="例如 G:\\U3DS (只能有英文字母和数字)" oninput="dlDestCheck()">
+<button class="btn gray" onclick="browseDl()">📂 浏览文件夹</button></div>
+<div class="hint err" id="dldestmsg" style="margin-top:2px">{esc(dest_bad)}</div>
+<div class="drow"><button class="btn" id="dlgo" onclick="startDl(false)">▶ 开始下载</button>
+<button class="btn gray" id="dlcancel" onclick="cancelDl()" style="display:none">✖ 取消下载</button>
+<span class="hint" id="dlmsg"></span></div>
+<div class="bar" id="dlbar" style="display:none"><i id="dlfill"></i></div>
+<div class="hint" id="dlstage" style="white-space:pre-line"></div>
+<pre class="dllog" id="dllog" style="display:none"></pre>
+<div class="drow" id="dlok" style="display:none">
+<button class="btn" onclick="useDl()">✔ 就用这个开服端, 继续第 2 步</button>
+<span class="hint" id="dlres"></span></div>
+</div>""")
+    dedi_card = f"""<div class="dedi{dedi_cls}">
+<div class="dt">🛠 <b>{dedi_title}</b></div>
+<div class="dd">{dedi_dd}</div>
+<div class="drow">{store_btn}{dedi_dl_btn}
+<button class="btn gray" onclick="reScan()">🔄 重新检测本机</button>
+<span class="hint" id="scanmsg"></span></div>
+{dl_html}
+</div>"""
+
+    # 已经绑到游戏本体上的老用户: 先说清楚为什么被退回第 1 步
+    bad_card = f"""<div class="step" style="border-color:rgba(248,113,113,.45)">
+<h2 class="err">⚠ 之前绑的目录不能开服</h2>
+<div class="desc"><b>{esc(bound)}</b><br>{esc(bad_dir)}</div>
+<div class="hint">已经在游戏本体的 Servers 文件夹里建过存档? 把那个存档文件夹整个剪切到开服端的
+Servers 下面, 再重新设置一次就能接着用, 数据不会丢。</div>
+</div>""" if bad_dir else ""
+
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>初始设置 · Dawn Sharkk</title>
 <script>try{{var t=new URLSearchParams(location.search).get('theme')||localStorage.getItem('untheme');
@@ -4258,18 +5697,21 @@ if(t)localStorage.setItem('untheme',t);}}catch(e){{}}</script>
 <div class="wiz">
 <div class="logo"><img class="logo-img" src="/logo.png" style="width:72px;height:72px" alt="logo">
 <div><b style="font-size:20px">Dawn Sharkk</b>
-<div class="desc">首次使用, 两步完成设置 (保存在本文件夹 settings.json)</div></div></div>
-
+<div class="desc">首次使用, 两步完成设置 (保存在本文件夹 settings.json)
+{' · 简装版 v' + VERSION + ' (不含开服端下载)' if LITE else ' · 完整版 v' + VERSION}</div></div></div>
+{bad_card}
 <div class="step" id="step1">
 <h2>第 1 步 · 选择游戏目录</h2>
 <div class="desc">就是 Unturned 服务器 (U3DS) 所在的文件夹, 里面应该有 Unturned.exe。下面是自动探测到的位置:</div>
 {dir_btns or '<div class="desc err">没有自动找到, 请手动粘贴路径</div>'}
 <label class="f" style="display:block;margin:12px 0 4px;color:var(--sub);font-size:13px">或手动输入游戏目录完整路径:</label>
 <input class="f" id="gdir" placeholder="例如 E:\\SteamLibrary\\steamapps\\common\\U3DS"
- value="{esc(gdir or '')}">
+ value="{esc(bound or '')}">
 <div style="margin-top:12px"><button class="btn" onclick="pickDir(document.getElementById('gdir').value.trim())">✔ 确认这个目录</button>
 <span id="s1msg" class="hint"></span></div>
-<div class="hint">提示: 目录确认后会列出该游戏里已有的服务器存档</div>
+<div class="hint">提示: 目录确认后会列出该游戏里已有的服务器存档。别选成平时玩游戏的 Unturned 本体 ——
+两个文件夹里都有 Unturned.exe, 但用本体开服会直接报错, 开服器现在会拦下来</div>
+{dedi_card}
 </div>
 
 <div class="step" id="step2" style="display:{'block' if step2_visible else 'none'}">
@@ -4320,6 +5762,7 @@ async function chooseInst(){{
   toast2((r&&r.msg)||'操作失败, 请重试',1);
  }}catch(e){{toast2('请求失败: '+e+' (开服器窗口还开着吗?)',1);}}
  finally{{btn.disabled=false;}}}}
+{DEDI_JS}
 </script></body></html>"""
 
 
@@ -4436,6 +5879,8 @@ class Handler(BaseHTTPRequestHandler):
                 "instance": instance(), "game_dir": game_dir()})
         if u.path == "/setup":
             return self._html(page_setup())
+        if u.path == "/api/serverdedi/status":
+            return self._json(dl_snapshot())
         if not setup_done():
             return self._redirect("/setup")
         if u.path == "/":
@@ -4521,9 +5966,9 @@ class Handler(BaseHTTPRequestHandler):
         # ---- 初始设置 (不受 setup_done 限制)
         if u.path == "/api/setup":
             gdir = str(body.get("game_dir", "")).strip().strip('"')
-            if not game_exe_ok(gdir):
-                return self._json({"ok": False,
-                                   "msg": "该目录下没有找到 Unturned.exe, 请确认是 U3DS 服务器目录"})
+            err = check_game_dir(gdir)
+            if err:
+                return self._json({"ok": False, "msg": err})
             _settings["game_dir"] = gdir
             if instance() and not os.path.isdir(os.path.join(gdir, "Servers", instance())):
                 _settings["instance"] = None
@@ -4533,8 +5978,9 @@ class Handler(BaseHTTPRequestHandler):
                                "msg": "游戏目录已保存"})
 
         if u.path == "/api/setup/instance":
-            if not game_exe_ok(game_dir()):
-                return self._json({"ok": False, "msg": "请先设置有效的游戏目录"})
+            err = bound_dir_error()
+            if err:
+                return self._json({"ok": False, "msg": err})
             name = str(body.get("name", "")).strip()
             running, _ = server_running()
             if running and name != instance():
@@ -4557,6 +6003,40 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "created": created,
                                "rocket": rocket_status(),
                                "msg": f"已选择存档「{name}」"})
+
+        # ---- 开服端下载 (初始设置阶段就要能用, 所以在 setup_done 门槛之前)
+        if u.path == "/api/dirs":
+            return self._json(list_dirs(str(body.get("path", ""))[:500]))
+
+        if u.path == "/api/serverdedi/scan":
+            return self._json({"ok": True, "found": scan_dedi_installs()})
+
+        if u.path == "/api/serverdedi/start":
+            if LITE:
+                return self._json({"ok": False,
+                                   "msg": "简装版不带开服端下载, 请自己去 Steam 装 "
+                                          "Unturned - Dedicated Server (U3DS)"})
+            found = scan_dedi_installs()   # 点下载时必须再查一遍本机, 别白下 1.5 GB
+            if found and not body.get("force"):
+                return self._json({"ok": False, "exists": found,
+                                   "msg": "检测到本机已经有可用的开服端, 不用重复下载"})
+            ok, msg = start_download(str(body.get("dest", ""))[:500])
+            return self._json({"ok": ok, "msg": msg})
+
+        if u.path == "/api/serverdedi/cancel":
+            if LITE:
+                return self._json({"ok": False, "msg": "简装版不带开服端下载"})
+            ok, msg = cancel_download()
+            return self._json({"ok": ok, "msg": msg})
+
+        if u.path == "/api/serverdedi/update":
+            ok, msg = start_update()
+            return self._json({"ok": ok, "msg": msg})
+
+        if u.path == "/api/serverdedi/use":
+            ok, msg, path = adopt_dedi(str(body.get("path", ""))[:500])
+            return self._json({"ok": ok, "msg": msg, "game_dir": path,
+                               "instances": list_instances() if ok else []})
 
         if not setup_done():
             return self._json({"ok": False, "msg": "请先完成初始设置"})
@@ -4665,9 +6145,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "msg": "请先在确认弹窗里勾选同意"})
             ok, msg, target = delete_saves(items, str(body.get("dest", ""))[:500])
             return self._json({"ok": ok, "msg": msg, "dest": target})
-
-        if u.path == "/api/dirs":
-            return self._json(list_dirs(str(body.get("path", ""))[:500]))
 
         if u.path == "/api/file":
             full = safe_path(str(body.get("path", "")))
@@ -4818,13 +6295,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "msg": f"「{s['name']}」已设为 {name}, 重启服务器后生效"})
 
         if u.path == "/api/gameplay":
-            kv = body.get("kv", {})
-            count, fail = 0, []
+            kv = body.get("kv", {}) or {}
+            clean, errs, bad_ids = {}, [], []
             for fullkey, val in kv.items():
-                sec, key = fullkey.split("|", 1)
-                val = str(val) if val is not None and str(val) != "" else None
+                dk = str(fullkey)
+                if dk not in CFG_SPECS:
+                    errs.append(f"{dk}: 不认识的配置项")
+                    bad_ids.append(dk)
+                    continue
+                norm, err = gameplay_check(dk, "" if val is None else val)
+                if err:
+                    errs.append(err)
+                    bad_ids.append(dk)
+                else:
+                    clean[dk] = norm
+            if errs:
+                oplog("错误", f"玩法设置校验未通过 ({len(errs)} 项): " + " | ".join(errs[:6]))
+                return self._json({"ok": False, "count": 0, "items": bad_ids,
+                                   "msg": "有 " + str(len(errs)) + " 项填得不对, 这次一个都没写入: "
+                                          + " / ".join(errs[:4])
+                                          + ("…" if len(errs) > 4 else "")})
+            count, fail = 0, []
+            for dk, norm in clean.items():
+                sec, key = dk.split("|", 1)
                 try:
-                    if set_cfg(config_txt(), sec, key, val):
+                    if set_cfg(config_txt(), sec, key, norm):
                         count += 1
                     else:
                         fail.append(key)
