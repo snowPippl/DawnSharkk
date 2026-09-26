@@ -32,7 +32,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 OPLOG_PATH = os.path.join(BASE_DIR, "操作日志.txt")
 HOST, PORT = "127.0.0.1", 8787
-VERSION = "0.1.12"           # 发布版本号: 改这里 + 新增 更新内容-版本号.md + 跑 发布打包.py
+VERSION = "0.1.14"           # 发布版本号: 改这里 + 新增 更新内容-版本号.md + 跑 发布打包.py
 # 发行版本: full = 完整版 (自带 SteamCMD 下载开服端)。从 v0.1.12 起只发完整版 ——
 # 自带的工具才 1.6 MB, 再单独出一份"没有下载功能"的简装版没意义。
 # lite 分支的代码保留, 只为兼容手里还拿着旧简装包的人。
@@ -99,29 +99,115 @@ def setup_done():
 
 
 # 游戏本体 (客户端) 和专用开服端里都有 Unturned.exe, 光看 exe 分不出来。
-# 真机上能区分的只有这几样: 客户端有 BattlEye 客户端程序、steam_appid.txt 写 304930,
-# 还带 Worlds / Preferences.json; 开服端 (Steam 或 SteamCMD 下的) 三样都没有。
-# 判据别放宽 —— Servers / Modules / Extras / BattlEye 这些两边都有, 拿来判断会误伤。
+# 能区分的三条"残留"信号: 客户端带 BattlEye 启动器、steam_appid.txt 写本体的 304930、
+# 还有 Worlds + Preferences.json (单人存档和游戏设置)。
+# ⚠ 这三条全是运行残留而不是安装标识 —— 真机取证: steam_appid.txt 的 mtime 等于
+# 那次运行写出的 Logs mtime, 而不是 Steam 的 LastUpdated。所以一份真开服端只要被本体的
+# 文件污染过 (整合包 / 手拷 / 网上教程让建的 304930 文件), 单看残留就会一直误判。
+# 因此判据分三层: Steam 的 appmanifest 身份证 > 目录名叫 U3DS > 其他目录要命中两条。
 CLIENT_APPID = "304930"
+SIGNAL_DESC = {
+    "be": "目录里有 Unturned_BE.exe (BattlEye 客户端启动器, 开服端没有)",
+    "appid": "steam_appid.txt 写着 " + CLIENT_APPID + " (游戏本体的 AppID)",
+    "worlds": "目录里同时有 Worlds 和 Preferences.json (本体的单人存档与游戏设置)",
+}
 
 
-def client_dir_reason(gdir):
-    """空串 = 不像游戏本体; 否则返回给用户看的判据"""
-    if not gdir or not os.path.isdir(gdir):
-        return ""
-    if os.path.isfile(os.path.join(gdir, "Unturned_BE.exe")):
-        return "目录里有 Unturned_BE.exe"
+def _steam_appid(gdir):
+    """读 steam_appid.txt 第一行。Valve 写这个文件时结尾带 \\x00, str.strip() 去不掉"""
     try:
         with open(os.path.join(gdir, "steam_appid.txt"),
                   encoding="utf-8", errors="replace") as f:
-            if f.readline().strip() == CLIENT_APPID:
-                return f"steam_appid.txt 写着 {CLIENT_APPID}"
+            return f.readline().strip("\x00 \t\r\n")
     except OSError:
-        pass
+        return ""
+
+
+def client_signals(gdir):
+    """这个目录里出现了哪几条「只有客户端才有」的残留 (只报事实, 不下结论)"""
+    if not gdir or not os.path.isdir(gdir):
+        return []
+    hits = []
+    if os.path.isfile(os.path.join(gdir, "Unturned_BE.exe")):
+        hits.append("be")
+    if _steam_appid(gdir) == CLIENT_APPID:
+        hits.append("appid")
     if os.path.isdir(os.path.join(gdir, "Worlds")) \
             and os.path.isfile(os.path.join(gdir, "Preferences.json")):
-        return "目录里有 Worlds 和 Preferences.json"
+        hits.append("worlds")
+    return hits
+
+
+_manifest_cache = {}
+
+
+def steam_install_dirs(appid, maxage=120):
+    """Steam 客户端自己记在 appmanifest 里的安装目录 (用户改不动, 唯一权威的身份证)"""
+    now = time.time()
+    got = _manifest_cache.get(appid)
+    if got and now - got[0] < maxage:
+        return got[1]
+    out = set()
+    for root in steam_library_roots():
+        acf = os.path.join(root, "steamapps", "appmanifest_%s.acf" % appid)
+        try:
+            with open(acf, encoding="utf-8", errors="replace") as f:
+                m = re.search(r'"installdir"\s+"([^"]+)"', f.read())
+            if m:
+                out.add(os.path.normcase(os.path.normpath(
+                    os.path.join(root, "steamapps", "common", m.group(1)))))
+        except OSError:
+            continue
+    _manifest_cache[appid] = (now, out)
+    return out
+
+
+def is_steam_dir(gdir, appid):
+    """这个文件夹是不是 Steam 装的某个 app (304930=本体 / 1110390=开服端)"""
+    return bool(gdir) and os.path.normcase(os.path.normpath(gdir)) \
+        in steam_install_dirs(str(appid))
+
+
+def client_dir_reason(gdir):
+    """空串 = 可以当开服端用; 否则返回一句萌新看得懂的「这是本体」的理由"""
+    if not gdir or not os.path.isdir(gdir):
+        return ""
+    if is_steam_dir(gdir, DEDI_APPID):
+        return ""                       # Steam 亲装的开服端, 残留一律不定罪
+    if is_steam_dir(gdir, CLIENT_APPID):
+        return "Steam 的记录 (appmanifest_" + CLIENT_APPID + ") 说这个文件夹就是游戏本体"
+    hits = client_signals(gdir)
+    if "be" in hits:
+        return SIGNAL_DESC["be"]        # 这条开服端绝不会有, 单独定罪
+    if os.path.basename(os.path.normpath(gdir)).lower() == "u3ds":
+        return ""                       # 名字对得上 Steam 默认安装名: 降级成黄字提醒
+    if len(hits) >= 2:
+        return "、".join(SIGNAL_DESC[h] for h in hits)
     return ""
+
+
+def client_soft_note(gdir):
+    """放行但目录里有客户端残留: 一句黄字提醒 (不拦路)"""
+    hits = [h for h in client_signals(gdir) if h != "be"]
+    if not hits or client_dir_reason(gdir):
+        return ""
+    return ("这个文件夹里还留着本体的文件 (" + "、".join(SIGNAL_DESC[h] for h in hits) +
+            ") —— 不影响开服, 但说明它可能被本体文件污染过。万一开服时抛 "
+            "NullReferenceException at SDG.Unturned.Assets.Update(), 就是这份开服端里混了客户端文件")
+
+
+def dir_evidence(gdir):
+    """三条判据各自的实测结果 —— 报错里带上它, 用户截一张图就能定位是哪条判据命中"""
+    hits = client_signals(gdir)
+    who = ("Steam 装的开服端" if is_steam_dir(gdir, DEDI_APPID) else
+           "Steam 装的游戏本体" if is_steam_dir(gdir, CLIENT_APPID) else
+           "不在任何 Steam 库里 (自己下载或拷贝的)")
+    return " | ".join([
+        "Unturned_BE.exe: " + ("有" if "be" in hits else "没有"),
+        "steam_appid.txt: " + (_steam_appid(gdir) or "没有这个文件"),
+        "Worlds+Preferences.json: " + ("都有" if "worlds" in hits else "没有"),
+        "Steam 记录: " + who,
+    ])
 
 
 def game_exe_ok(gdir):
@@ -141,9 +227,11 @@ def check_game_dir(gdir):
                 + ("本机没有的话, 回到第 1 步点「🛒 在 Steam 商店打开开服端」装一个 (免费), "
                    "商店那条路走不动再点备用的「🔻 用 SteamCMD 下载」"
                    if not LITE else
-                   "本机没有的话, 先在 Steam 商店装一个免费的 Unturned - Dedicated Server (U3DS)"))
+                   "本机没有的话, 先在 Steam 商店装一个免费的 Unturned - Dedicated Server (U3DS)")
+                + " (本目录实测: " + dir_evidence(gdir) + ")")
     if not os.path.isfile(os.path.join(gdir, "Unturned.exe")):
-        return "该目录下没有找到 Unturned.exe, 请确认是 U3DS 服务器目录"
+        return ("该目录下没有找到 Unturned.exe, 请确认是 U3DS 服务器目录"
+                " (本目录实测: " + dir_evidence(gdir) + ")")
     return ""
 
 
@@ -187,7 +275,11 @@ def steam_library_roots():
 
 
 def detect_game_dirs():
-    """探测常见 Steam 库里的 U3DS 目录"""
+    """探测各 Steam 库里的开服端目录
+
+    除了默认文件夹名 U3DS, 还认 appmanifest_1110390.acf 里记的 installdir ——
+    用户把开服端文件夹改过名、或者库不在常见盘符上, 光按名字找就永远探测不到。
+    """
     found = []
 
     def add(p):
@@ -196,17 +288,30 @@ def detect_game_dirs():
             found.append(p)
 
     for root in steam_library_roots():
-        add(os.path.join(root, "steamapps", "common", "U3DS"))
+        common = os.path.join(root, "steamapps", "common")
+        add(os.path.join(common, "U3DS"))
         add(os.path.join(root, "SteamLibrary", "steamapps", "common", "U3DS"))
+        acf = os.path.join(root, "steamapps", "appmanifest_%s.acf" % DEDI_APPID)
+        try:
+            with open(acf, encoding="utf-8", errors="replace") as f:
+                m = re.search(r'"installdir"\s+"([^"]+)"', f.read())
+            if m:
+                add(os.path.join(common, m.group(1)))
+        except OSError:
+            pass
     return found
 
 
 def detect_client_dirs():
-    """本机的 Unturned 游戏本体目录 —— 只用来比对版本, 拿它开服会报错"""
+    """本机的 Unturned 游戏本体目录 —— 只用来比对版本, 拿它开服会报错
+
+    这里要的是「像不像本体」, 不是「能不能开服」, 所以命中任意一条残留就算, 不走三层判据。
+    """
     found = []
     for root in steam_library_roots():
         p = os.path.normpath(os.path.join(root, "steamapps", "common", "Unturned"))
-        if client_dir_reason(p) and os.path.normcase(p) not in map(os.path.normcase, found):
+        if (client_signals(p) or is_steam_dir(p, CLIENT_APPID)) \
+                and os.path.normcase(p) not in map(os.path.normcase, found):
             found.append(p)
     return found
 
@@ -1490,6 +1595,389 @@ GAMEPLAY_FIELDS = [
     ]),
 ]
 
+# ================================================================ 高级配置 (玩法设置没列的其余 Config.txt 参数)
+# 每项: (键, 中文名, 类型, 一行说明)。类型 num=非负数字 / pct=0~1 的概率 / count=整数 / bool=开关 / text=一行文字。
+# 这批是原版 Config.txt 里剩下没被表单收录的键: 官方没公布安全范围, 所以 num 只挡负数和乱码, 不设上下限,
+# 说明里只写"往哪边调会发生什么", 拿不准的一律在说明里点明"别动"。
+# 值留空 = 写回原版默认 (这一项交还给游戏自己决定)。
+ADVANCED_SECTIONS = [
+    ("Players", "玩家 (进阶)", [
+        ("Health_Regen_Min_Food", "回血所需最低饱食度", "num",
+         "饱食度低于这个数就不会自动回血 (原版普通难度 90)。"),
+        ("Health_Regen_Min_Water", "回血所需最低含水量", "num",
+         "和上面那条一样, 看的是水分。低于这个数不回血。"),
+        ("Health_Regen_Ticks", "自动回血间隔", "num",
+         "隔多久回一次血, 数字越小回得越勤 (原版 60)。"),
+        ("Food_Use_Ticks", "饱食度下降间隔", "num",
+         "隔多久掉一格饱食度, 数字越小饿得越快 (简单 350 / 普通 300 / 困难 250)。"),
+        ("Food_Damage_Ticks", "饿到见底掉血间隔", "num",
+         "饱食度掉到 0 之后, 隔多久扣一次血 (原版 15)。"),
+        ("Water_Use_Ticks", "含水量下降间隔", "num",
+         "数字越小渴得越快 (简单 320 / 普通 270 / 困难 220)。"),
+        ("Water_Damage_Ticks", "渴到见底掉血间隔", "num",
+         "水分掉到 0 之后, 隔多久扣一次血。"),
+        ("Virus_Default", "出生免疫力", "num",
+         "一出生有多少免疫值 (原版 100)。免疫掉破底线会开始生病掉血。"),
+        ("Virus_Infect", "感染触发线", "num",
+         "免疫值掉到这个数以下就一路往下掉 (原版 50)。"),
+        ("Virus_Use_Ticks", "免疫力下降间隔", "num", "数字越小免疫掉得越快。"),
+        ("Virus_Damage_Ticks", "免疫见底掉血间隔", "num",
+         "免疫掉到 0 之后, 隔多久扣一次血。"),
+        ("Leg_Regen_Ticks", "断腿恢复时长", "num",
+         "腿断了要多久自己长好 (原版 750)。数字越大断腿越难受。"),
+        ("Bleed_Regen_Ticks", "流血自愈时长", "num",
+         "不用绷带时, 流血状态多久自己停 (原版 750)。"),
+        ("Bleed_Damage_Ticks", "流血掉血间隔", "num", "流血期间隔多久扣一次血。"),
+        ("Can_Fix_Legs", "可以自行接骨", "bool",
+         "开 = 能用夹板一类物品把断腿治好; 关 = 只能等它自己长。"),
+        ("Can_Stop_Bleeding", "可以止血", "bool",
+         "开 = 绷带能止血; 关 = 止血不了, 只能等流血自己停。"),
+        ("Detect_Radius_Multiplier", "僵尸与动物的察觉距离倍率", "num",
+         "离多近就会被发现 (简单 0.5 / 普通 1 / 困难 1.25)。想潜服玩就调小。"),
+        ("Ray_Aggressor_Distance", "判定凶手的射线距离(米)", "num",
+         "系统靠这条射线算「是谁打的」, 关系到伤害归因和战报 (原版 8)。没弄清就别动。"),
+        ("Spawn_With_Stamina_Skills", "出生满体力类技能", "bool",
+         "开 = 一出生心肺、健身、潜水、跑酷这几项直接满级, 不用练。"),
+        ("Skillset_Reduces_Skill_Cost", "职业套装减少技能消耗", "bool",
+         "开 = 穿上对应职业套装时, 升级技能的经验打折。"),
+        ("Skillset_Prevents_Skill_Loss", "职业套装防止掉技能", "bool",
+         "开 = 穿着对应套装时死亡不会掉技能等级。"),
+        ("Prevent_Level_Skill_Overrides", "禁止等级覆盖技能", "bool",
+         "开 = 不让游戏的等级/难度规则回头改写玩家已经点好的技能。"),
+        ("Allow_Per_Character_Saves", "允许每个角色独立存档", "bool",
+         "开 = 同一个账号可以各练各的角色; 联机服默认是关的。"),
+        ("Enable_Terrain_Color_Kick", "受伤时画面色彩抖动", "bool",
+         "纯粹是画面效果: 开 = 挨打时地面颜色会闪一下。想减少晕动感就关。"),
+    ]),
+    ("Zombies", "僵尸 (进阶)", [
+        ("Flanker_Chance", "包抄僵尸出现概率", "pct",
+         "刷出来的僵尸里有多少是会绕路包抄你的。"),
+        ("Burner_Chance", "自燃僵尸出现概率", "pct",
+         "身上带火、靠近会点着你的那种僵尸的比例。"),
+        ("Acid_Chance", "吐酸僵尸出现概率", "pct",
+         "会远程吐酸水的那种僵尸的比例。"),
+        ("Spirit_Chance", "幽灵僵尸出现概率", "pct",
+         "半透明、不容易看见的那批僵尸的比例。"),
+        ("Boss_Electric_Chance", "电系精英僵尸出现概率", "pct",
+         "带放电效果的精英怪出现概率。"),
+        ("Boss_Wind_Chance", "风系精英僵尸出现概率", "pct", "带风效果的精英怪出现概率。"),
+        ("Boss_Fire_Chance", "火系精英僵尸出现概率", "pct", "带火效果的精英怪出现概率。"),
+        ("Boss_Elver_Stomper_Chance", "踩踏型精英出现概率", "pct",
+         "体型大、靠踩踏攻击的那只精英怪出现概率。"),
+        ("Boss_Kuwait_Chance", "特定精英僵尸出现概率", "pct",
+         "官方维基没有这一项的说明, 是某张地图专属的精英怪。不知道就别动。"),
+        ("DL_Red_Volatile_Chance", "红色易爆僵尸概率", "pct",
+         "打死会爆炸的红色变异僵尸比例。"),
+        ("DL_Blue_Volatile_Chance", "蓝色易爆僵尸概率", "pct",
+         "打死会爆炸的蓝色变异僵尸比例。"),
+        ("Respawn_Night_Time", "夜里尸体复活时间(秒)", "num",
+         "晚上的尸体过多少秒刷回一只新僵尸; 数字越小夜里越凶。"),
+        ("Respawn_Beacon_Time", "僵尸信标重生时间(秒)", "num",
+         "信标被拆掉之后, 过多少秒重新刷出来。"),
+        ("Quest_Boss_Respawn_Interval", "任务首领重生间隔", "num",
+         "任务用的那只精英怪多久重新刷一只。"),
+        ("Backstab_Multiplier", "背刺伤害倍率", "num",
+         "从背后偷袭僵尸时伤害乘多少。"),
+        ("NonHeadshot_Armor_Multiplier", "非爆头部位承伤倍率", "num",
+         "打身体(不打头)时僵尸挨多少伤害; 数字越大越好打。"),
+        ("Beacon_Experience_Multiplier", "拆信标经验倍率", "num",
+         "清掉一个僵尸信标给的经验乘多少。"),
+        ("Full_Moon_Experience_Multiplier", "满月夜经验倍率", "num",
+         "月圆那晚打僵尸的经验乘多少。"),
+        ("Min_Drops", "僵尸最少掉几件", "count", "每只僵尸死亡保底掉几样东西。"),
+        ("Max_Drops", "僵尸最多掉几件", "count", "每只僵尸最多掉几样, 和上面的最小值一起决定随机区间。"),
+        ("Min_Mega_Drops", "巨型僵尸最少掉几件", "count", "大块头僵尸死亡保底掉落数。"),
+        ("Max_Mega_Drops", "巨型僵尸最多掉几件", "count", "大块头僵尸死亡掉落上限。"),
+        ("Min_Boss_Drops", "精英最少掉几件", "count", "精英僵尸死亡保底掉落数。"),
+        ("Max_Boss_Drops", "精英最多掉几件", "count", "精英僵尸死亡掉落上限。"),
+        ("Slow_Movement", "僵尸整体减速", "bool",
+         "开 = 僵尸移动速度整体降一档, 跑得没玩家快。"),
+        ("Can_Stun", "僵尸可被击晕", "bool",
+         "开 = 挨重击时僵尸会短时间僵住不动。"),
+        ("Only_Critical_Stuns", "只有暴击才能击晕", "bool",
+         "开 = 只有打出暴击那一下才把僵尸打晕。"),
+        ("Can_Target_Objects", "僵尸会破坏场景物件", "bool",
+         "开 = 僵尸会推倒树、集装箱一类场景物件; 关 = 只追人不动东西。"),
+        ("Weapons_Use_Player_Damage", "僵尸用玩家伤害倍率", "bool",
+         "开 = 僵尸捡起武器打人时, 按「玩家受伤倍率」那一套算伤害, 不再单独乘僵尸自己的系数。"),
+        ("Beacon_Max_Rewards", "信标最多发几个奖励", "count",
+         "一个信标被拆掉时最多掉几份奖励。"),
+        ("Beacon_Max_Participants", "信标最多算几个人", "count",
+         "拆信标时最多给前几名参与的人记功、发奖励。"),
+        ("Beacon_Rewards_Multiplier", "信标奖励倍率", "num",
+         "信标奖励的数量乘多少。"),
+    ]),
+    ("Animals", "动物 (进阶)", [
+        ("Respawn_Time", "动物复活时间(秒)", "num",
+         "鹿、熊这类动物被打死之后, 过多久在同一带刷回来。"),
+        ("Damage_Multiplier", "动物伤害倍率", "num",
+         "动物咬你有多疼。0 = 咬不动。"),
+        ("Armor_Multiplier", "动物承伤倍率", "num",
+         "你打动物时伤害乘多少; 数字越小动物越耐打。"),
+        ("Max_Instances_Tiny", "小地图上动物数量上限", "count", "地图尺寸很小时全图最多同时存在多少只动物。"),
+        ("Max_Instances_Small", "较小地图动物上限", "count", "地图尺寸「小」时的同屏总量上限。"),
+        ("Max_Instances_Medium", "中等地图动物上限", "count", "地图尺寸「中」时的总量上限。"),
+        ("Max_Instances_Large", "大地图动物上限", "count", "地图尺寸「大」时的总量上限。"),
+        ("Max_Instances_Insane", "超大地图动物上限", "count", "地图尺寸「疯狂」时的总量上限。"),
+        ("Weapons_Use_Player_Damage", "动物用玩家伤害倍率", "bool",
+         "开 = 动物拿武器时按玩家伤害那一套算, 不再单独乘动物的系数。"),
+    ]),
+    ("Vehicles", "载具 (进阶)", [
+        ("Min_Battery_Charge", "刷出来的车最低电量", "pct",
+         "车上电瓶至少有几分电 (0~1)。填 1 = 每辆车都满电。"),
+        ("Max_Battery_Charge", "刷出来的车最高电量", "pct",
+         "车上电瓶最多带几分电 (0~1)。和最低电量一起决定随机区间。"),
+        ("Min_Natural_Vehicles", "地图上至少有多少台车", "count",
+         "自然刷新的车辆数量底线, 免得整张图找不着一台车。"),
+        ("Max_Instances_Tiny", "小地图车辆数量上限", "count", "地图尺寸很小时全图最多同时存在多少台车。"),
+        ("Max_Instances_Small", "较小地图车辆上限", "count", "地图尺寸「小」时的车辆总量上限。"),
+        ("Max_Instances_Large", "大地图车辆上限", "count", "地图尺寸「大」时的车辆总量上限。"),
+        ("Max_Instances_Insane", "超大地图车辆上限", "count", "地图尺寸「疯狂」时的车辆总量上限。"),
+        ("Melee_Repair_Multiplier", "近战修理车辆倍率", "num",
+         "拿锤子敲车能修回多少; 数字越大一锤顶得越多。"),
+        ("Unlocked_After_Seconds_In_Safezone", "停进安全区多久自动解锁", "num",
+         "车在安全区里停够这么多秒就自动上锁/解锁到位, 免得在区域内抢车。"),
+    ]),
+    ("Barricades", "家具与路障 (进阶)", [
+        ("Melee_Repair_Multiplier", "近战修理家具倍率", "num",
+         "拿锤子修补路障、栏杆这类家具能修回多少, 数字越大越省材料。"),
+        ("Allow_Item_Placement_On_Vehicle", "允许在车上放家具", "bool",
+         "开 = 能把箱子、架子固定到车体上; 关 = 车上放不了。"),
+        ("Allow_Trap_Placement_On_Vehicle", "允许在车上放陷阱", "bool",
+         "开 = 能把地刺、电线一类的陷阱装到车上。"),
+        ("Max_Item_Distance_From_Hull", "车上物品离车身最远距离", "num",
+         "装车上的家具允许超出车身多少; 太大就会出现悬在车外的东西。"),
+        ("Max_Trap_Distance_From_Hull", "车上陷阱离车身最远距离", "num",
+         "装车的陷阱允许超出车身多少, 和上面那条同理。"),
+    ]),
+    ("Structures", "建筑 (进阶)", [
+        ("Melee_Repair_Multiplier", "近战修理建筑倍率", "num",
+         "拿锤子修墙、地板能修回多少, 数字越大越省材料。"),
+    ]),
+    ("Items", "物品 (进阶)", [
+        ("Despawn_Natural_Time", "地上物品多久消失(秒)", "num",
+         "掉在地上的东西过多久自然消失。调大能保住朋友掉在地上的背包。"),
+        ("Quality_Full_Chance", "物资直接满品质的概率", "pct",
+         "捡起来就是全新的东西占多少比例。"),
+        ("Quality_Multiplier", "物资品质倍率", "num",
+         "刷出来的东西耐用品质的整体倍率; 调大 = 满地都是好东西。"),
+        ("Gun_Bullets_Full_Chance", "枪械自带满弹概率", "pct",
+         "刷出来的枪一拿到手就是满弹匣的比例。"),
+        ("Gun_Bullets_Multiplier", "枪械子弹倍率", "num",
+         "枪里带多少发子弹的整体倍率。"),
+        ("Magazine_Bullets_Full_Chance", "弹匣满弹概率", "pct",
+         "捡到的弹匣本来就是满的比例。"),
+        ("Magazine_Bullets_Multiplier", "弹匣子弹倍率", "num",
+         "刷出来的弹匣里装多少发的整体倍率。"),
+        ("Crate_Bullets_Full_Chance", "弹药箱满弹概率", "pct",
+         "弹药箱一刷新就是满的比例。"),
+        ("Crate_Bullets_Multiplier", "弹药箱子弹倍率", "num",
+         "弹药箱里的子弹数量倍率。"),
+        ("Food_Spawns_At_Full_Quality", "食物总是满品质刷新", "bool",
+         "开 = 找到的罐头、零食一律是全新的, 不会放着放着坏掉。"),
+        ("Water_Spawns_At_Full_Quality", "饮水总是满品质刷新", "bool",
+         "开 = 瓶装水、水桶一类刷新出来就是满状态。"),
+        ("Clothing_Spawns_At_Full_Quality", "衣服总是满品质刷新", "bool",
+         "开 = 捡到的护甲、衣服一上手就是全新的。"),
+        ("Weapons_Spawn_At_Full_Quality", "武器总是满品质刷新", "bool",
+         "开 = 捡到的枪和近战武器一律全新, 不用先修一遍。"),
+        ("Default_Spawns_At_Full_Quality", "其余物品总是满品质刷新", "bool",
+         "开 = 上面没单列的所有物品都按全新刷新。"),
+        ("Clothing_Has_Durability", "衣服会穿坏", "bool",
+         "开 = 护甲和衣服会掉耐久、最终穿破; 关 = 永远不坏。"),
+        ("Weapons_Have_Durability", "武器会用坏", "bool",
+         "开 = 枪和近战武器会掉耐久、需要修理; 关 = 打不坏。"),
+    ]),
+    ("Objects", "场景物件 (进阶)", [
+        ("Resource_Reset_Multiplier", "采集点恢复倍率", "num",
+         "树、矿石这类采集点刷回可采状态的速度, 数字越小刷得越快。"),
+        ("Resource_Drops_Multiplier", "采集点产出倍率", "num",
+         "砍树、挖矿一次给多少材料。"),
+        ("Water_Reset_Multiplier", "水源恢复倍率", "num",
+         "水桶、水洼被舀空之后多久恢复, 数字越小越快。"),
+        ("Fuel_Reset_Multiplier", "油料点恢复倍率", "num",
+         "加油机这类油料点被抽干后恢复的速度。"),
+        ("Binary_State_Reset_Multiplier", "开关类物件复位倍率", "num",
+         "门、集装箱、抽屉这类「开/关」状态物件恢复的速度, 数字越小越快。"),
+        ("Rubble_Reset_Multiplier", "废墟复位倍率", "num",
+         "被打坏的墙体、家具变回的瓦砾堆多久恢复。"),
+        ("Allow_Holiday_Drops", "允许节日掉落物", "bool",
+         "开 = 万圣节、圣诞这类节日期间场景会掉对应道具; 关 = 不掉落。"),
+        ("Items_Obstruct_Tree_Respawns", "有物品挡着就不刷树", "bool",
+         "开 = 树的位置上还有掉落物时, 这棵树不刷新 (原版行为); 关 = 照样刷。"),
+    ]),
+    ("Events", "空投与天气 (进阶)", [
+        ("Weather_Frequency_Multiplier", "天气变化频率倍率", "num",
+         "所有天气切换的整体速度。数字越大天气换得越勤。"),
+        ("Rain_Frequency_Min", "下雨最短间隔", "num", "两场雨之间最少等多久。"),
+        ("Rain_Frequency_Max", "下雨最长间隔", "num", "两场雨之间最多等多久。"),
+        ("Rain_Duration_Min", "下雨最短持续", "num", "一场雨最少下多久。"),
+        ("Rain_Duration_Max", "下雨最长持续", "num", "一场雨最多下多久。"),
+        ("Snow_Frequency_Min", "下雪最短间隔", "num", "两场雪之间最少等多久。"),
+        ("Snow_Frequency_Max", "下雪最长间隔", "num", "两场雪之间最多等多久。"),
+        ("Snow_Duration_Min", "下雪最短持续", "num", "一场雪最少下多久。"),
+        ("Snow_Duration_Max", "下雪最长持续", "num", "一场雪最多下多久。"),
+        ("Airdrop_Speed", "空投下落速度", "num",
+         "空投降落伞往下飘的速度, 调慢大家来得及抢。"),
+        ("Airdrop_Force", "空投落地冲击", "num",
+         "空投砸地上的力度; 调太大落点附近的人和建筑会被砸坏。"),
+        ("Arena_Clear_Timer", "竞技场清场计时(秒)", "num",
+         "竞技场事件判定「这一波清完」要等多久。"),
+        ("Arena_Finale_Timer", "竞技场决赛计时(秒)", "num", "最后一波给多少秒。"),
+        ("Arena_Restart_Timer", "竞技场重开计时(秒)", "num", "一波打完到下一波开始之间等多久。"),
+        ("Arena_Use_Compactor_Pause", "竞技场压缩墙启用暂停", "bool",
+         "开 = 压缩墙在波次之间会停下来等玩家喘口气。"),
+        ("Arena_Compactor_Pause_Timer", "压缩墙暂停时长(秒)", "num",
+         "压缩墙中间歇多久再继续收。"),
+        ("Arena_Compactor_Delay_Timer", "压缩墙启动延迟(秒)", "num",
+         "竞技场开场多久之后压缩墙才开始往里收。"),
+        ("Arena_Compactor_Shrink_Factor", "压缩墙收缩系数", "num",
+         "压缩墙往里收的幅度; 数字越大圈缩得越狠。"),
+        ("Arena_Compactor_Damage", "压缩墙伤害", "num",
+         "被压缩墙压到一次扣多少血。"),
+        ("Arena_Compactor_Extra_Damage_Per_Second", "压缩墙每秒附加伤害", "num",
+         "一直待在墙里时每秒额外扣多少血。"),
+        ("Arena_Compactor_Speed_Tiny", "最小地图压缩墙速度", "num",
+         "竞技场所在地图尺寸「极小」时墙收拢的速度。"),
+        ("Arena_Compactor_Speed_Small", "小地图压缩墙速度", "num", "地图尺寸「小」时墙收拢的速度。"),
+        ("Arena_Compactor_Speed_Medium", "中等地图压缩墙速度", "num", "地图尺寸「中」时墙收拢的速度。"),
+        ("Arena_Compactor_Speed_Large", "大地图压缩墙速度", "num", "地图尺寸「大」时墙收拢的速度。"),
+        ("Arena_Compactor_Speed_Insane", "超大地图压缩墙速度", "num", "地图尺寸「疯狂」时墙收拢的速度。"),
+    ]),
+    ("Gameplay", "玩法与手感 (进阶)", [
+        ("Ballistics", "启用真实弹道", "bool",
+         "开 = 子弹走弹道 (受下坠等影响); 关 = 按传统射线判定命中。改这一项对枪感影响很大。"),
+        ("Repair_Level_Max", "修理可用技能上限", "count",
+         "修东西最高能吃到几级修理技能。"),
+        ("Allow_Static_Groups", "允许固定组队", "bool", "开 = 玩家可以建长期固定的队伍。"),
+        ("Allow_Dynamic_Groups", "允许临时组队", "bool", "开 = 允许临时凑的动态队伍。"),
+        ("Allow_Lobby_Groups", "允许大厅组队", "bool", "开 = 进服之前就能在列表上先组队。"),
+        ("Group_Player_List", "界面显示队友列表", "bool",
+         "开 = 屏幕上列出当前队友; 关 = 不显示这一栏。"),
+        ("Max_Group_Members", "组队人数上限", "count", "一支队伍最多几个人。"),
+        ("Timer_Leave_Group", "离线多久自动退队(秒)", "num",
+         "队友离线超过这么多秒就自动踢出队伍。"),
+        ("Bypass_Buildable_Mobility", "无视家具可移动限制", "bool",
+         "开 = 摆放家具不再检查它属不属于「可移动」那一类, 想放就放。"),
+        ("Bypass_No_Building_Zones", "无视禁建区", "bool",
+         "开 = 地图上标了不能建的区域也照样能建。会让部分地图的规则失去意义, 想清楚再开。"),
+        ("Allow_Freeform_Buildables", "允许任意角度摆放", "bool",
+         "开 = 家具可以任意角度对着放, 不用只能贴格子。"),
+        ("Allow_Freeform_Buildables_On_Vehicles", "车上允许任意角度", "bool",
+         "开 = 车上的家具也能任意角度摆放。"),
+        ("Allow_Holidays", "启用节日内容", "bool",
+         "开 = 万圣节、圣诞这类节日装饰与内容会出现在服里。"),
+        ("Enable_Workstation_Requirements", "工作台讲究条件", "bool",
+         "开 = 在工作台上做东西要满足技能、工具等条件; 关 = 直接就能做。"),
+        ("Enable_Fishing_Catch_Challenge", "钓鱼要搏斗", "bool",
+         "开 = 上钩之后要玩那一段搏斗小游戏才能收杆; 关 = 上了钩直接给鱼。"),
+        ("Min_Fishing_Bite_Interval", "鱼上钩最短间隔", "num", "甩竿之后最快多久可能有口。"),
+        ("Max_Fishing_Bite_Interval", "鱼上钩最长间隔", "num", "最慢多久一定有口, 和上面那条一起决定随机区间。"),
+        ("Fishing_MaxStrength_Bite_Interval_Multiplier", "体力满时咬钩间隔倍率", "num",
+         "玩家体力满的时候咬钩间隔乘多少。"),
+        ("Explosion_Launch_Speed_Multiplier", "爆炸抛飞速度倍率", "num",
+         "被炸飞时人和物飞出去的速度乘多少。"),
+        ("AirStrafing_Acceleration_Multiplier", "空中平移加速倍率", "num",
+         "在半空中左右移动的加速手感乘多少。"),
+        ("AirStrafing_Deceleration_Multiplier", "空中平移减速倍率", "num",
+         "在半空中刹车的减速乘多少, 调大了会有点飘。"),
+        ("FirstPerson_RecoilMultiplier", "第一人称后坐力倍率", "num",
+         "第一人称开枪时的镜头后坐力乘多少。"),
+        ("FirstPerson_AimingRecoilMultiplier", "第一人称机瞄后坐力倍率", "num",
+         "第一人称开着机瞄射击时的后坐力乘多少。"),
+        ("FirstPerson_AimingZoomRecoilReduction", "第一人称开镜后坐力削减", "num",
+         "开镜倍率越高削减多少后坐力; 数字大 = 瞄着打更稳。"),
+        ("ThirdPerson_RecoilMultiplier", "第三人称后坐力倍率", "num", "第三人称视角下的后坐力乘多少。"),
+        ("ThirdPerson_SpreadMultiplier", "第三人称散布倍率", "num", "第三人称视角下的弹散布乘多少。"),
+        ("Viewmodel_AimingJumpLandMultiplier", "落地时武器晃动倍率", "num",
+         "跳下落地那一下手里那把枪在画面里晃多少。"),
+        ("Viewmodel_AimingMisalignmentMultiplier", "瞄准时武器错位倍率", "num",
+         "举枪瞄准时画面里的枪和实际准星错开多少。"),
+        ("Enable_Damage_Flinch", "挨打时镜头一顿", "bool",
+         "开 = 受到伤害时角色和镜头会抽一下; 关 = 不受影响, 想打 PVP 更顺可以关。"),
+        ("Enable_Explosion_Camera_Shake", "爆炸时镜头震动", "bool",
+         "开 = 炸点附近镜头会抖; 关 = 不抖。"),
+        ("Disable_Motion_Sickness_Options", "屏蔽防晕选项", "bool",
+         "开 = 玩家客户端里那些「防晕镜头」选项不再由服务器决定。一般不用动。"),
+        ("Disable_Foliage_Off", "不许关闭植被", "bool",
+         "开 = 不让玩家把草和树关掉, 视野统一、但配置差的玩家会更卡。"),
+        ("Use_2D_Scope_Overlay", "瞄准镜用 2D 画面", "bool",
+         "开 = 开镜是 2D 遮罩画面 (更省资源); 关 = 用 3D 镜片效果。"),
+    ]),
+    ("Server", "服务器与防刷屏 (进阶)", [
+        ("Timeout_Queue_Seconds", "排队等待超时(秒)", "num",
+         "服务器满了以后朋友在队列里最多等多久, 超了就断开。"),
+        ("Max_Packets_Per_Second", "每秒数据包上限", "num",
+         "单个连接每秒最多发多少个包。调太低正常玩都会掉线, 只在你清楚做什么时改。"),
+        ("Join_Rate_Limit_Window_Seconds", "进服频率限制窗口(秒)", "num",
+         "在这个时间窗内统计进服次数, 配合下面的阈值挡连点/开挂秒进。"),
+        ("Bad_Packet_Rate_Limit_Window_Seconds", "坏包统计窗口(秒)", "num",
+         "多久之内统计一次「发坏包」的次数。"),
+        ("Bad_Packet_Rate_Limit_Threshold", "坏包次数上限", "count",
+         "窗口内坏包到了这个数就进入限制。乱调低会把有 mod 的玩家当外挂踢。"),
+        ("Rate_Limit_Kick_Threshold", "超限制直接踢人阈值", "count",
+         "超过多少次限制之后直接踢出服务器。"),
+        ("Max_Clients_With_Same_IP_Address", "同一 IP 最多几个连接", "count",
+         "同一个 IP 地址允许同时连几个人。网吧/学校出口共用 IP 时别设成 1。"),
+        ("Max_Clients_With_Same_IP_Address_Log_Warnings", "同 IP 超限写警告日志", "bool",
+         "开 = 有人超过上面那个数量时往日志写一条警告。"),
+        ("Fake_Lag_Threshold_Seconds", "假延迟判定阈值(秒)", "num",
+         "一个包晚到超过这么多秒就算作「假延迟/作弊」, 配合下面两条罚。"),
+        ("Fake_Lag_Log_Warnings", "假延迟写警告日志", "bool",
+         "开 = 判定到假延迟时往日志写警告。"),
+        ("Fake_Lag_Damage_Penalty_Multiplier", "假延迟伤害惩罚倍率", "num",
+         "被判假延迟的人打出的伤害乘多少 (调小就是罚他打不动人)。"),
+        ("Enable_Kick_Input_Spam", "狂发输入就踢", "bool",
+         "开 = 短时间内疯狂上报输入的玩家会被踢; 手残误点宏的玩家可以被冤枉, 想清楚再开。"),
+        ("Enable_Kick_Input_Timeout", "输入超时就踢", "bool",
+         "开 = 长时间不上报输入(卡住/挂连接)的玩家会被踢下线。"),
+        ("Chat_Always_Use_Rich_Text", "聊天一律走富文本", "bool",
+         "开 = 聊天框强制用富文本渲染 (颜色、图标那些更完整)。"),
+        ("Enable_Scheduled_Shutdown", "启用定时关服", "bool",
+         "开 = 服务器到点自己关, 配合下面两条填几点关、提前警告几次。"),
+        ("Scheduled_Shutdown_Time", "定时关服时刻", "text",
+         "填游戏要求的时刻格式 (例如 04:00)。这一项格式不对不会生效, 建议先在原始编辑器里对照写法。"),
+        ("Scheduled_Shutdown_Warnings", "关服前警告次数", "count",
+         "定时关服之前分几次向在线玩家广播警告。"),
+        ("Enable_Update_Shutdown", "开服端更新后自动关服", "bool",
+         "开 = 检测到需要更新时自己关服去更新。挂着朋友在玩时别开。"),
+        ("Update_Shutdown_Warnings", "更新关服前警告次数", "count",
+         "为了更新而关服之前分几次广播警告。"),
+        ("Reset_Vehicles_Outside_Horizontal_Distance", "车离多远才重置(米)", "num",
+         "玩家离开车辆多远之后车重置状态 (防止车被丢在半路永远占着)。"),
+        ("Validate_EconInfo_Hash", "校验 Steam 经济信息哈希", "bool",
+         "和 Steam 物品/经济数据校验有关。P2P 朋友服一般不用动, 不清楚就别关。"),
+        ("Use_FakeIP", "使用 Fake IP", "bool",
+         "官方服务器列表那边的网络相关开关, 本工具的代码联机用不上, 别动。"),
+    ]),
+    ("UnityEvents", "地图事件脚本 (进阶)", [
+        ("Allow_Server_Messages", "允许服务端消息", "bool",
+         "给模组/地图里的事件脚本用: 开 = 允许往服务端发事件消息。不确定就别开。"),
+        ("Allow_Server_Commands", "允许服务端指令", "bool",
+         "给模组/地图里的事件脚本用: 开 = 允许事件脚本执行服务端指令, 等于给它发指令的权力。"),
+        ("Allow_Client_Messages", "允许客户端消息", "bool",
+         "开 = 允许事件脚本走客户端那头的消息通道。"),
+        ("Allow_Client_Commands", "允许客户端指令", "bool",
+         "开 = 允许事件脚本执行客户端指令。来路不明的地图/模组开这一项有安全风险。"),
+    ]),
+    ("Browser", "服务器列表简介 (进阶)", [
+        ("Desc_Hint", "列表里的一行短简介", "text",
+         "朋友在服务器列表看到的那一行短介绍。"),
+        ("Desc_Full", "完整简介", "text",
+         "点开你这一栏时显示的整段介绍。"),
+        ("Desc_Server_List", "服务器列表说明", "text",
+         "列表页里再补的一句说明文字。"),
+    ]),
+]
+
+# 这几项和账号凭据 / 官方服务器登录 / 商业化有关, 交给用户填只会泄露信息或搞出误会, 高级配置不提供
+ADVANCED_DENY = {("Browser", "Login_Token"), ("Browser", "BookmarkHost"),
+                 ("Browser", "Is_Using_Anycast_Proxy"), ("Browser", "Monetization"),
+                 ("Server", "Update_Steam_Beta_Name")}
+ADV_TYPE_CN = {"num": "填数字 (不能是负数)", "pct": "只能填 0 ~ 1",
+               "count": "填整数", "bool": "只能选 开 / 关 / 默认",
+               "text": "填一行文字"}
+
 # ================================================================ 三档难度的原版默认值
 # 换 mode 时游戏就是整套替换这批默认值, 数值来自游戏自己的难度配置表 (Easy / Normal / Hard)。
 # 只列「玩法设置」页面里能单独改的项, 这样每一项都能标出「你已经手动填过 -> 换难度不再动它」。
@@ -1646,6 +2134,141 @@ def gameplay_check(dk, raw):
     if hi is not None and v > hi:
         return None, f"{name} 最大是 {num_out(hi)} (你填了 {num_out(v)})"
     return num_out(v), ""
+
+
+# ================================================================ 高级配置 (玩法设置里默认收起那一批)
+ADV_SPECS = {}
+for _sec, _sec_cn, _items in ADVANCED_SECTIONS:
+    for _k, _cn, _t, _hint in _items:
+        ADV_SPECS[f"{_sec}|{_k}"] = {"dk": f"{_sec}|{_k}", "sec": _sec, "sec_cn": _sec_cn,
+                                     "key": _k, "label": _cn, "type": _t, "hint": _hint}
+
+
+def cfg_section_keys(path):
+    """这份 Config.txt 里出现过的 段|键 (小写) —— 用来判断某项是「改已有」还是「新插入」"""
+    try:
+        text, _ = read_file(path)
+    except OSError:
+        return {}
+    out = {}
+    for it in parse_cfg(text):
+        if it["type"] == "setting" and len(it["section"]) == 1:
+            out.setdefault(f"{it['section'][0]}|{it['key']}".lower(), it["value"])
+    return out
+
+
+def cfg_insert_setting(items, section, key, value):
+    """把文件里还没有的键插进对应段落; 连段落都没有就在末尾补一段 (只认最外层段落, 段落名按文件里的大小写)"""
+    depth, hit = 0, None
+    for i, it in enumerate(items):
+        if it["type"] == "sectopen" and depth == 0 and it["key"].lower() == section.lower():
+            hit = (i, it["key"])
+            break
+        if it["type"] == "brace":
+            depth += 1 if it["raw"].strip() == "{" else -1
+    if hit:
+        i, sec_name = hit
+        nxt = items[i + 1] if i + 1 < len(items) else None
+        if nxt and nxt["type"] == "brace" and nxt["raw"].strip() == "{":
+            items.insert(i + 2, {"type": "setting", "key": key, "value": value,
+                                 "indent": "\t", "section": (sec_name,)})
+            return True
+        return False
+    for raw in ("", section, "{", None, "}"):
+        if raw is None:
+            items.append({"type": "setting", "key": key, "value": value,
+                          "indent": "\t", "section": (section,)})
+        elif raw == "{":
+            items.append({"type": "brace", "raw": "{"})
+        elif raw == "}":
+            items.append({"type": "brace", "raw": "}"})
+        elif raw == section:
+            items.append({"type": "sectopen", "raw": section, "key": section})
+        else:
+            items.append({"type": "other", "raw": raw})
+    return True
+
+
+def set_cfg_value(path, section, key, value):
+    """写一个「Config.txt 里可能还没有」的键; 已有就改值 (键名大小写照文件里的原样), 没有就插一笔。
+    返回 set=改已有 / new=新插一笔 / skip=想留默认而文件里本来也没有 / fail=没写进去"""
+    _ensure_cfg_file(path)
+    text, _ = read_file(path)
+    items = parse_cfg(text)
+    for it in items:
+        if it["type"] == "setting" and len(it["section"]) == 1 \
+                and it["section"][0].lower() == section.lower() \
+                and it["key"].lower() == key.lower():
+            it["value"] = value
+            write_file(path, build_cfg(items))
+            return "set"
+    if value is None:
+        return "skip"                       # 文件里没有这一笔, 而用户要的是"交回游戏" —— 本来就是不写
+    if not cfg_insert_setting(items, section, key, value):
+        return "fail"
+    write_file(path, build_cfg(items))
+    return "new"
+
+
+def adv_check(dk, raw):
+    """高级配置逐项体检: 官方没公布范围, 所以只挡「一定会写坏文件或一定被游戏无视」的填法"""
+    sp = ADV_SPECS.get(dk)
+    if not sp:
+        return None, "这一项开服器没有收录, 不能写"
+    name = f"{sp['sec_cn']} · {sp['label']}"
+    s = str("" if raw is None else raw).strip()
+    if s == "":
+        return None, ""
+    t = sp["type"]
+    if t == "bool":
+        low = s.lower()
+        if low not in ("true", "false"):
+            return None, f"{name} 只能选 开 / 关 / 默认"
+        return low.capitalize(), ""
+    if t == "text":
+        if len(s) > 200:
+            return None, f"{name} 太长了 (最多 200 字, 现在 {len(s)} 字)"
+        if "{" in s or "}" in s or "[" in s or "]" in s or "//" in s \
+                or "\n" in s or "\r" in s:
+            return None, (f"{name} 里不能有换行、大括号或注释符号 —— "
+                          "这几样会把 Config.txt 的段落结构写坏")
+        return s, ""
+    try:
+        v = float(s.replace(",", "").replace("，", ""))
+    except ValueError:
+        return None, f"{name} 要填数字, 现在填的是「{s[:16]}」"
+    if v != v or v in (float("inf"), float("-inf")):
+        return None, f"{name} 这个数游戏算不出来, 换一个正常的"
+    if v < 0:
+        return None, f"{name} 不能是负数 (你填了 {num_out(v)})"
+    if t == "count" and v != int(v):
+        return None, f"{name} 只能填整数 (你填了 {num_out(v)})"
+    if t == "pct" and v > 1:
+        return None, f"{name} 是概率, 只能填 0 ~ 1 (你填了 {num_out(v)})"
+    return num_out(v), ""
+
+
+def cfg_adv_rows():
+    """高级配置表单要渲染的行: 按段分组, 每项带上当前值和「这个存档的 Config.txt 里有没有这一笔」
+    只是打开页面看一眼, 所以这里绝不建文件 —— 文件还没有就整页显示成"没写过" """
+    path = config_txt()
+    cur = cfg_section_keys(path) if os.path.isfile(path) else {}
+    groups, total = [], 0
+    for sec, sec_cn, items in ADVANCED_SECTIONS:
+        rows = []
+        for key, label, typ, hint in items:
+            if (sec, key) in ADVANCED_DENY:
+                continue
+            dk = f"{sec}|{key}"
+            got = cur.get(dk.lower())
+            rows.append({"dk": dk, "sec": sec, "sec_cn": sec_cn, "key": key,
+                         "label": label, "type": typ, "hint": hint,
+                         "cur": got if got is not None else "",
+                         "untouched": dk.lower() not in cur})
+        if rows:
+            total += len(rows)
+            groups.append((sec, sec_cn, rows))
+    return groups, total
 
 
 # ---- 新建存档时生成的配置文件 ----
@@ -1899,6 +2522,11 @@ def list_maps():
                 if os.path.isdir(os.path.join(base, name)) and low not in seen:
                     seen.add(low)
                     maps.append(name)
+    for e in workshop_maps():          # 创意工坊地图也算"真实存在的地图"
+        low = e["map"].lower()
+        if low not in seen:
+            seen.add(low)
+            maps.append(e["map"])
     return maps
 
 
@@ -1917,6 +2545,77 @@ def norm_map_name(name):
 def map_exists(name):
     """Commands.dat 里写的地图名是否真的存在 (Windows 下大小写不敏感)"""
     return norm_map_name(name)[1]
+
+
+# ================================================================ 创意工坊地图
+# 创意工坊内容下载后落在: 存档\Workshop\Steam\content\304930\<模组ID>\
+# 判定"这是一个地图"的标准 (按用户给的样本目录定的):
+#   模组ID 文件夹里有 Map.meta  →  与 Map.meta 同级的文件夹名 = 游戏里的地图名
+#   (样本: content\304930\3707778928\Map.meta + California2\ → 地图名 California2)
+# 没有 Map.meta 的那些 ID 文件夹是别的模组或地图的"资产包", 不当地图。
+WS_APPID = CLIENT_APPID         # 创意工坊内容目录用游戏本体的 AppID 命名
+WS_FILE_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id=%d"
+
+
+def workshop_maps():
+    """本存档里已经下载好的创意工坊地图: [{map, id, url}]"""
+    out = []
+    sd = server_dir()
+    if not sd:
+        return out
+    base = os.path.join(sd, "Workshop", "Steam", "content", WS_APPID)
+    try:
+        pids = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for pid in pids:
+        pdir = os.path.join(base, pid)
+        if not pid.isdigit() or not os.path.isfile(os.path.join(pdir, "Map.meta")):
+            continue
+        try:
+            subs = sorted(os.listdir(pdir))
+        except OSError:
+            continue
+        for nm in subs:
+            if os.path.isdir(os.path.join(pdir, nm)):
+                out.append({"map": nm, "id": int(pid), "url": WS_FILE_URL % int(pid)})
+    return out
+
+
+def workshop_map_of(name):
+    """当前 Commands.dat 写的地图是不是创意工坊地图 (是 → 返回那条记录)"""
+    name = (name or "").strip()
+    if not name:
+        return None
+    low = name.lower()
+    for e in workshop_maps():
+        if e["map"].lower() == low:
+            return e
+    return None
+
+
+def ws_start_notice(ok):
+    """开服成功后要不要弹资产包提醒: 当前地图是创意工坊地图 → 返回那条记录 + 存档目录"""
+    if not ok:
+        return None
+    e = workshop_map_of(cmd_info().get("map"))
+    if not e:
+        return None
+    e = dict(e)
+    e["inst"] = server_dir() or ""
+    return e
+
+
+def ws_subscribed_ids():
+    """本存档 WorkshopDownloadConfig.json 里订阅了多少个创意工坊内容"""
+    sd = server_dir()
+    if not sd:
+        return []
+    full = os.path.join(sd, "WorkshopDownloadConfig.json")
+    try:
+        return [int(i) for i in json.loads(read_file(full)[0]).get("File_IDs", [])]
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
 
 
 # ================================================================ 登录密钥 (每次启动随机生成)
@@ -3278,6 +3977,20 @@ a.btn{color:#fff}
 .sp{font-size:11.5px;color:var(--acc2);margin:6px 0 0;line-height:1.6}
 .det{font-size:12px;color:var(--sub);margin:3px 0 0;line-height:1.7}
 .gperr{font-size:11.5px;color:var(--bad);margin:4px 0 0;min-height:0}
+/* 玩法设置: 默认收起的高级配置 */
+.advbox{border:1px solid var(--codebd);border-radius:16px;background:rgba(255,255,255,.02);margin-bottom:16px}
+.advbox>summary{list-style:none;cursor:pointer;padding:15px 20px;font-size:14.5px;font-weight:700;
+color:var(--acc2);user-select:none;display:flex;align-items:center;gap:9px;flex-wrap:wrap;outline:0}
+.advbox>summary::-webkit-details-marker{display:none}
+.advbox>summary::before{content:'▸';font-size:13px;line-height:1}
+.advbox[open]>summary::before{content:'▾'}
+.advbox>summary:hover{background:var(--codebg)}
+.advbox>summary em{font-style:normal;font-weight:400;font-size:12px;color:var(--sub)}
+.advbox[open]>summary{border-bottom:1px solid var(--line)}
+.advbody{padding:14px 14px 0}
+.advbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 6px 13px}
+.advfilter{flex:1 1 250px;min-width:190px}
+.advhide{display:none !important}
 /* steamcmd 进度条 (初始设置下载 / 服务器设置更新 共用) */
 .bar{height:9px;border-radius:999px;background:var(--line);overflow:hidden;margin:12px 0 6px}
 .bar i{display:block;height:100%;width:0;border-radius:999px;transition:width .6s;
@@ -3601,6 +4314,44 @@ function pick(o){return new Promise(function(res){
  document.addEventListener('keydown',function esc(e){
   if(e.key==='Escape'){document.removeEventListener('keydown',esc);done(o.cancel||'stay');}});
 });}
+/* ---- 开服后: 用的是创意工坊地图 → 弹 10 秒资产包提醒 ---- */
+function wsNotice(o){
+ if(document.querySelector('.mask[data-wsnote]'))return;
+ var m=document.createElement('div');m.className='mask';m.setAttribute('data-wsnote','1');
+ var box=document.createElement('div');box.className='modal-box wide';
+ var h=document.createElement('h3');h.textContent='🧩 本次开的地图来自创意工坊: '+o.map;
+ var bd=document.createElement('div');bd.className='mbd';bd.style.whiteSpace='normal';
+ function para(t){var p=document.createElement('p');p.style.cssText='margin:0 0 12px';
+  p.textContent=t;bd.appendChild(p);}
+ para('创意工坊地图里, 有些还要另外下载一份资产包 (也是创意工坊文件)。'+
+   '资产包没到位时地图会加载失败, 或者进去是一片空图。');
+ para('检查这张地图有没有资产包, 请移步到它所在的创意工坊页面查看; '+
+   '有的话一并订阅, 再启动一遍服务器让游戏把文件下载下来。');
+ para('另外提醒: 更换地图后, 原先地图和角色存档仍然保存在这台服务器里, '+
+   '但之前的建筑和角色数据不能转移到新地图, 相当于开了个新档。'+
+   '把地图换回原来那张, 老档内容就还在。');
+ var p=document.createElement('p');
+ p.style.cssText='margin:0;color:#94a3b8;font-size:12px';
+ p.textContent='您当前的服务器存档目录在: '+(o.inst||'(未设置)');
+ bd.appendChild(p);
+ var bt=document.createElement('div');bt.className='mbtns';
+ var a=document.createElement('a');a.className='btn gray';
+ a.textContent='🧩 在创意工坊打开这张地图';
+ a.href=o.url;a.target='_blank';a.rel='noopener noreferrer';
+ a.style.textDecoration='none';
+ var okb=document.createElement('button');okb.className='btn';okb.disabled=true;
+ okb.style.opacity='.5';okb.style.cursor='not-allowed';
+ bt.appendChild(a);bt.appendChild(okb);
+ box.appendChild(h);box.appendChild(bd);box.appendChild(bt);m.appendChild(box);
+ document.body.appendChild(m);
+ var left=10;
+ okb.textContent='知道了 ('+left+' 秒)';
+ var t=setInterval(function(){left--;
+  if(left<=0){clearInterval(t);okb.disabled=false;okb.textContent='知道了';
+   okb.style.opacity='';okb.style.cursor='';return;}
+  okb.textContent='知道了 ('+left+' 秒)';},1000);
+ okb.onclick=function(){if(okb.disabled)return;clearInterval(t);m.remove();};
+}
 /* ---- 彩蛋: 连点左上角图标 5 次 → 贡献者名单 ---- */
 var CREDITS=[
  ['💻','Pippl','Dawn Sharkk 作者 · 界面 / 功能 / 文档','作者'],
@@ -3737,6 +4488,7 @@ document.querySelectorAll('[data-act]').forEach(b=>b.addEventListener('click',as
   if(useRk)await doRocketInstall();
   else sessionStorage.setItem('rkIgnored','1');}
  b.disabled=true;var r=await post('/api/'+a);b.disabled=false;toast(r.msg,r.ok?0:1);
+ if(r&&r.wsmap)wsNotice(r.wsmap);
  setTimeout(refreshStatus,1200);}));
 syncThemeSwitch();
 refreshStatus();setInterval(refreshStatus,4000);
@@ -4148,13 +4900,22 @@ def page_commands():
 
     cur_map = (vals.get("map") or "").strip()
     detected = list_maps()
+    ws_list = workshop_maps()
+    ws_ids = {e["map"].lower(): e["id"] for e in ws_list}
     unknown_map = bool(cur_map) and cur_map.lower() not in {m.lower() for m in detected}
     # 存档里写的地图探测不到 (创意工坊还没下载 / 手填的名字): 也要原样显示, 绝不能假装是 PEI
     maps = ([cur_map] + detected) if unknown_map else detected
     map_opts = '<option value="">— 选择地图 —</option>' + "".join(
-        f'<option value="{esc(m)}" {"selected" if cur_map.lower() == m.lower() else ""}>'
-        f'{esc(m)}{" (探测不到, 请核对拼写)" if unknown_map and m == cur_map else ""}</option>'
+        f'<option value="{esc(m)}" data-ws="{ws_ids.get(m.lower(), "")}"'
+        f' {"selected" if cur_map.lower() == m.lower() else ""}>'
+        f'{esc(m)}'
+        + (f' · 🧩 创意工坊 {ws_ids[m.lower()]}' if m.lower() in ws_ids
+           else ' (探测不到, 请核对拼写)' if unknown_map and m == cur_map else '')
+        + '</option>'
         for m in maps)
+    ws_hint0 = ("已识别到 " + str(len(ws_list)) + " 张: " + "、".join(e["map"] for e in ws_list)
+                if ws_list else
+                "本存档还没下载好任何创意工坊地图 (填完 ID 要把服务器启动一遍, 游戏才会去下)")
     map_state = ("Commands.dat 当前写入的地图: " + cur_map) if cur_map \
         else "还没设置地图 (游戏会用默认的 PEI)"
     others = [e for e in entries if e["key"] and e["key"].lower() not in known
@@ -4214,12 +4975,18 @@ def page_commands():
 <input class="f" data-key="name" id="i_name" value="{esc(vals.get('name',''))}"></div>
 <div><label class="f"><b>地图</b><code class="k">Map &lt;地图名&gt;</code></label>
 <select class="f" id="i_map" onchange="showMap()">{map_opts}</select>
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+<button class="btn sm gray" id="wsbtn" onclick="scanWs()">🧩 识别本存档的创意工坊地图</button>
+<span class="hint" id="wshint" style="margin:0">{ws_hint0}</span></div>
 <label class="f" style="font-size:12px">列表里没有你要的地图? 在这里照原样填 (填了就优先生效):</label>
 <input class="f" id="i_map_custom" placeholder="手动输入地图名" oninput="showMap()">
 <div class="st on" id="st_map">{map_state}</div>
-<div class="hint">下拉框读的是 <code class="k">U3DS\\Maps</code> 和存档 <code class="k">Level</code> 里<b>真实存在的地图名</b>
-(大小写照原样)。创意工坊地图要先在「创意工坊」页订阅, 开服时才会自动下载。<b>换地图 = 换一张全新的世界</b>:
-建筑会重新生成, 老地图的建筑存档仍然保留在 <code class="k">Level\\旧地图名</code> 里, 名字改回去就能看到。</div></div>
+<div class="hint">下拉框读的是 <code class="k">U3DS\\Maps</code>、存档 <code class="k">Level</code>
+和已下载的<b>创意工坊地图</b>里真实存在的地图名 (大小写照原样)。
+<b>创意工坊地图要先在「创意工坊」页填 ID, 并把服务器启动一遍</b>让游戏把地图下载下来,
+回来点上面那个按钮才识别得到。<b>换地图 = 换一张全新的世界</b>:
+角色与建筑存档都不会跟过去 (相当于开新档), 老地图的存档仍然保留在
+<code class="k">Level\\旧地图名</code> 里, 名字改回去就能看到。</div></div>
 </div>
 <div class="grid g2">
 <div><label class="f"><b>最大玩家数</b><code class="k">maxplayers</code></label>
@@ -4300,15 +5067,58 @@ def page_commands():
 {browser_card}
 """
     script = DL_CORE_JS + "\nvar MODE_CUR=" + json.dumps(mode_cur) + ";" + \
-        "var MODE_DIFF=" + json.dumps(mode_diff, ensure_ascii=False) + ";" + """
+        "var MODE_DIFF=" + json.dumps(mode_diff, ensure_ascii=False) + ";" + \
+        "var MAP_BASE=" + json.dumps(detected, ensure_ascii=False) + ";" + \
+        "var WS_MAPS=" + json.dumps(ws_list, ensure_ascii=False) + ";" + \
+        "var MAP_CUR=" + json.dumps(cur_map, ensure_ascii=False) + ";" + \
+        "var INST_DIR=" + json.dumps(server_dir() or "", ensure_ascii=False) + ";" + """
+function esc1(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
+ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function mapVal(){
  var c=document.getElementById('i_map_custom').value.trim();
  return c||document.getElementById('i_map').value.trim();}
+function mapOpt(v,label,ws){var e=document.createElement('option');e.value=v;
+ if(ws)e.dataset.ws=ws;e.textContent=label;return e;}
+function renderMapSel(){
+ var sel=document.getElementById('i_map'),cur=mapVal();
+ sel.innerHTML='';
+ sel.appendChild(mapOpt('','— 选择地图 —'));
+ MAP_BASE.forEach(function(m){sel.appendChild(mapOpt(m,m));});
+ WS_MAPS.forEach(function(m){sel.appendChild(mapOpt(m.map,m.map+' · 🧩 创意工坊 '+m.id,m.id));});
+ var hit=cur&&[].some.call(sel.options,function(o){
+  return o.value&&o.value.toLowerCase()==cur.toLowerCase();});
+ if(hit)sel.value=cur;
+ else if(cur)document.getElementById('i_map_custom').value=cur;   /* 探测不到的名字留在手填框里, 别丢 */
+ showMap();}
+async function scanWs(){
+ var b=document.getElementById('wsbtn');b.disabled=true;
+ var r=null;
+ try{r=await post('/api/maps/workshop');}catch(e){r={ok:false,msg:'请求失败: '+e};}
+ finally{b.disabled=false;}
+ if(!r||!r.ok){toast((r&&r.msg)||'识别失败',1);return;}
+ WS_MAPS=r.maps||[];
+ renderMapSel();
+ document.getElementById('wshint').textContent=WS_MAPS.length?
+  ('已识别到 '+WS_MAPS.length+' 张: '+WS_MAPS.map(function(m){return m.map;}).join('、')+
+   ' · 本存档共订阅 '+r.subscribed+' 个创意工坊内容'):r.msg;
+ toast(WS_MAPS.length?('识别到 '+WS_MAPS.length+' 张创意工坊地图, 已经放进下拉框'):
+  '没识别到创意工坊地图: 填完 ID 要先启动一遍服务器, 游戏才会去下地图');}
+function mapChangeOk(mp){
+ var ws=WS_MAPS.filter(function(m){return m.map.toLowerCase()==mp.toLowerCase();})[0];
+ return modal({icon:'🗺️',title:'换成地图 '+mp+' 之前, 先看这几句',wide:true,danger:true,
+  okText:'我懂了, 换地图',noText:'先不换',
+  html:'换地图<b>相当于开一个新档</b>: 你的角色数据和建筑都不会跟到新地图里去。'+
+   '<br><br>· 老档<b>不会丢</b> —— 原地图的建筑仍然在 <code>Level\\\\'+esc1(MAP_CUR||'旧地图名')+
+   '</code> 里, 角色数据也还在,<b>把地图名换回去就能接着玩</b>。'+
+   '<br>· 您当前的服务器存档目录在: <code>'+esc1(INST_DIR)+'</code>'+
+   (ws?('<br>· 这次要换的是<b>创意工坊地图</b> '+esc1(ws.map)+' (模组 ID '+ws.id+
+        '), 本存档必须已经把它下载好了; 还没下载就先去「创意工坊」页填 ID, 再启动一遍服务器。'):'')+
+   '<br><br>改完记得<b>重启服务器</b>才生效 (改之前先关服, 否则服务器退出时会把旧配置写回去)。'});}
 function showMap(){
  var v=mapVal(),st=document.getElementById('st_map');
  st.textContent=v?('保存后将写入 Commands.dat: Map '+v):'⚠ 地图不能为空, 请选一个或手动填一个';
  st.className='st '+(v?'on':'off');}
-function save(){
+async function save(){
  var kv={};var bad='';var LB={maxplayers:'最大玩家数',port:'端口'};
  document.querySelectorAll('input.f[data-key]').forEach(el=>{
   var v=el.value.trim();
@@ -4317,6 +5127,7 @@ function save(){
   kv[el.dataset.key]=v;});
  var mp=mapVal();
  if(!mp){toast('地图不能为空: 请从下拉框选一个地图, 或在下面手动填写地图名',1);return;}
+ if(MAP_CUR&&mp.toLowerCase()!==MAP_CUR.toLowerCase()&&!(await mapChangeOk(mp)))return;
  kv.map=mp;
  var mode=document.querySelector('input[name=p_mode]:checked');
  if(mode)kv.mode=mode.value;
@@ -4433,6 +5244,55 @@ def page_gameplay():
 <div class="card" data-grp="game"><h2>{sec_cn} <code class="k">{sec}</code></h2>
 <div class="grid g3">{rows}</div></div>"""
 
+    adv_groups, adv_total = cfg_adv_rows()
+    adv_cards = ""
+    for sec, sec_cn, arows in adv_groups:
+        arows_html = ""
+        for r in arows:
+            fid, typ = f"a_{r['dk']}", r["type"]
+            cur, hint = r["cur"], r["hint"]
+            label, key = r["label"], r["key"]
+            tx = " ".join([label, key, sec, sec_cn, hint]).lower().replace('"', "'")
+            tag = ('<span class="pin">这一笔存档里还没写过</span>' if r["untouched"] else "")
+            if typ == "bool":
+                low = cur.lower()
+                inp = f"""<div class="pills">
+<label><input type="radio" name="{esc(fid)}" value="True" {'checked' if low == 'true' else ''}><span>开启</span></label>
+<label><input type="radio" name="{esc(fid)}" value="False" {'checked' if low == 'false' else ''}><span>关闭</span></label>
+<label><input type="radio" name="{esc(fid)}" value="" {'checked' if low not in ('true', 'false') else ''}><span>默认</span></label>
+</div>"""
+            else:
+                inp = (f'<input class="f" type="text" id="{esc(fid)}" data-t="{esc(typ)}"'
+                       f' placeholder="留空 = 游戏默认" value="{esc(cur)}" oninput="advCheck(this)">'
+                       f'<div class="gperr" id="m_{esc(fid)}"></div>')
+            arows_html += (f'<div class="advrow" data-tx="{esc(tx)}"><label class="f"><b>{label}</b>'
+                           f'<code class="k">{sec}/{key}</code></label>{tag}{inp}'
+                           f'<div class="sp">{esc(ADV_TYPE_CN[typ])} · {esc(hint)}</div></div>')
+        adv_cards += f"""
+<div class="card advsec" data-grp="gameadv"><h2>{sec_cn} <code class="k">{sec}</code></h2>
+<div class="grid g3">{arows_html}</div></div>"""
+
+    adv_box = f"""
+<details class="advbox" id="advbox"><summary>🔧 高级配置 — 另外 {adv_total} 项 Config.txt 设置
+<em>默认收起，不点开就当它不存在</em></summary>
+<div class="advbody">
+<div class="hint" style="margin:2px 6px 12px;padding:11px 14px;border:1px solid var(--line);
+border-left:3px solid var(--warn);border-radius:10px;background:var(--bg);font-size:12.5px;line-height:1.9">
+上面那批是把大家最常调的挑出来做的表单，这一批是<b>官方维基里剩下的那些 Config.txt 设置项</b>：
+僵尸首领掉落、天气频率、爆炸击退、服务器防刷屏之类。官方<b>没有公布这些项的安全取值范围</b>，
+所以开服器只挡住「一定会写坏文件」的填法 (负数、非数字、概率大于 1、含大括号或注释符号)，
+剩下的一律照你填的写。<b>不知道填什么的就留空</b> —— 留空 = 这一项交回游戏自己决定；
+填了字再清空并保存，才会把已经写进去的这一笔删回默认。
+登录凭据、官方服务器、Steam 测试分支这类涉及账号安全的项<b>有意没放进来</b>。
+<b>这块的保存按钮和上面是分开的</b>，填完记得点最底下那个「保存高级配置」。</div>
+<div class="advbar">
+<input class="f advfilter" type="text" id="advq" placeholder="🔍 关键词筛选: 中文或英文都行, 比如 僵尸 / Respawn / 掉落 / Vehicles" oninput="advFilter()">
+<span class="hint" id="advcnt"></span></div>
+{adv_cards}
+<div class="card"><button class="btn big" onclick="saveAdv()">💾 保存高级配置</button>
+<span class="hint" style="margin-left:12px">只写这一批 (上面「保存全部修改」管不到它)，重启服务器后生效</span></div>
+</div></details>"""
+
     content = f"""
 <div class="card"><h2>玩法参数精细调节</h2>
 <div class="desc">每一项都会写入当前存档的 <code class="k">Config.txt</code>。
@@ -4440,12 +5300,14 @@ def page_gameplay():
 数字留空或选「默认」= 交回给游戏自己决定 (此时会跟着「服务器设置」里的游戏难度走);
 填了数字就以你填的为准, 换难度也不会再改这一项。改完点下面的保存并重启服务器。
 常用的开关建议先去「一键设置」页搞定。</div>
-<div class="tip">不确定就别填: 填错方向不会毁存档, 点「默认」再保存就能退回原版行为。</div></div>
+<div class="tip">不确定就别填: 填错方向不会毁存档, 点「默认」再保存就能退回原版行为。
+要找的设置这一页没有? 最底下还有个默认收起的「🔧 高级配置」, 收着另外 {adv_total} 项 Config.txt 设置, 不点开就当它不存在。</div></div>
 {sections_html}
 <div class="card">
 <button class="btn big" onclick="save()">💾 保存全部修改</button>
 <a class="btn big gray" href="/edit?path=Config.txt">原始编辑器</a>
 <span class="hint" style="margin-left:12px">改过没保存就切页或开服, 会弹框提醒并帮你直接保存</span></div>
+{adv_box}
 """
     script = """
 function gpCheck(el){
@@ -4476,8 +5338,71 @@ async function save(){
   r.items.forEach(function(k){var el=document.getElementById('g_'+k);if(el)gpCheck(el);});
   var first=document.getElementById('g_'+r.items[0]);if(first)first.focus();}
  toast(r.ok?'✔ 已保存! 重启服务器后生效 (共 '+r.count+' 项)':'✘ '+r.msg,r.ok?0:1);}
-/* 防呆登记: 整页共用一个保存按钮 */
-var DIRTY_GROUPS=[{sel:'[data-grp=game]',name:'玩法参数',save:save}];
+/* ---- 高级配置: 默认收起的那一批, 有自己独立的保存按钮 ---- */
+function advShow(){var b=document.getElementById('advbox');if(b)b.open=true;}
+function advCheck(el){
+ var msg=document.getElementById('m_'+el.id), v=el.value.trim(), t=el.dataset.t||'num';
+ el.style.borderColor='';if(msg)msg.textContent='';
+ if(v==='')return true;
+ if(t==='text'){
+  if(v.length>200){el.style.borderColor='var(--bad)';
+   if(msg)msg.textContent='✘ 太长了, 最多 200 字 (现在 '+v.length+' 字)';return false;}
+  if(/[{}\[\]]/.test(v)||v.indexOf('//')>=0){el.style.borderColor='var(--bad)';
+   if(msg)msg.textContent='✘ 不能有括号或 // —— 会把 Config.txt 的段落结构写坏';return false;}
+  return true;}
+ var n=Number(v);
+ if(isNaN(n)||!isFinite(n)){el.style.borderColor='var(--bad)';
+  if(msg)msg.textContent='✘ 这一项要填数字, 现在填的看不懂';return false;}
+ if(n<0){el.style.borderColor='var(--bad)';
+  if(msg)msg.textContent='✘ 这一项不能是负数 (你填了 '+n+')';return false;}
+ if(t==='count'&&n!==Math.floor(n)){el.style.borderColor='var(--bad)';
+  if(msg)msg.textContent='✘ 这一项只能填整数 (你填了 '+n+')';return false;}
+ if(t==='pct'&&n>1){el.style.borderColor='var(--bad)';
+  if(msg)msg.textContent='✘ 这一项是概率, 只能填 0 ~ 1 (你填了 '+n+')';return false;}
+ return true;}
+function advCount(){var el=document.getElementById('advcnt');if(!el)return;
+ var all=document.querySelectorAll('.advrow'), n=0;
+ all.forEach(function(r){if(!r.classList.contains('advhide'))n++;});
+ var q=document.getElementById('advq');
+ el.textContent=(q&&q.value.trim())?('筛出 '+n+' / '+all.length+' 项'):('一共 '+all.length+' 项');}
+function advFilter(){
+ var q=(document.getElementById('advq').value||'').trim().toLowerCase();
+ document.querySelectorAll('.advsec').forEach(function(card){
+  var hit=0;
+  card.querySelectorAll('.advrow').forEach(function(r){
+   var ok=!q||(r.dataset.tx||'').indexOf(q)>=0;
+   r.classList.toggle('advhide',!ok);if(ok)hit++;});
+  card.classList.toggle('advhide',hit===0);});
+ advCount();}
+async function saveAdv(){
+ var kv={},bad=null,errs=0;
+ document.querySelectorAll('input[type=radio][name^=a_]:checked').forEach(el=>{
+  var p=el.name.slice(2).split('|');
+  kv[p[0]+'|'+p[1]]=el.value===''?null:el.value;});
+ document.querySelectorAll('input.f[id^=a_]').forEach(el=>{
+  if(!advCheck(el)){errs++;if(!bad)bad=el;}
+  var p=el.id.slice(2).split('|');
+  kv[p[0]+'|'+p[1]]=el.value.trim()===''?null:el.value.trim();});
+ if(bad){advShow();bad.focus();
+  toast('高级配置里有 '+errs+' 项填得不对, 已帮你定位到第一格 (看框下面的红字)',1);return;}
+ var r=await post('/api/gameplay/advanced',{kv:kv});
+ if(r.ok&&window.dirtySaved)dirtySaved('[data-grp=gameadv]');
+ if(!r.ok&&(r.items||[]).length){
+  advShow();
+  r.items.forEach(function(k){var el=document.getElementById('a_'+k);
+   if(el&&el.tagName==='INPUT')advCheck(el);});
+  var first=document.getElementById('a_'+r.items[0]);if(first)first.focus();}
+ toast(r.ok?'✔ 高级配置已保存! '+(r.count?('重启服务器后生效 (共 '+r.count+' 项)')
+   :'这一页没有需要写的改动 (填的值和游戏/文件里的一样)'):'✘ '+r.msg,r.ok?0:1);}
+/* 展开状态记在浏览器里: 点开过一次, 下次进这一页还是开着的 */
+(function(){var b=document.getElementById('advbox');if(!b)return;
+ try{if(localStorage.getItem('ds_advg')==='1')b.open=true;}catch(e){}
+ b.addEventListener('toggle',function(){try{
+  localStorage.setItem('ds_advg',b.open?'1':'0');}catch(e){}});
+ advCount();})();
+/* 防呆登记: 常规那一批和高级那一批各有各的保存按钮 */
+var DIRTY_GROUPS=[{sel:'[data-grp=game]',name:'玩法参数',save:save},
+ {sel:'[data-grp=gameadv]',name:'高级配置',save:saveAdv}];
 """
     return shell("game", "玩法设置", content, script, dirty=True)
 
@@ -5025,6 +5950,22 @@ Steam 上有两个 Unturned: <b>Unturned</b> 是你平时玩的游戏本体, <b>
 把里面那个存档文件夹整个<b>剪切</b>到开服端的 <code class="k">Servers</code> 目录下,
 重新选一次目录就能接着玩, 建筑和玩家数据都不会丢。</div></div>
 
+<div class="card"><h2>🔍 它是怎么认出「这是本体」的 (v0.1.13 起)</h2>
+<div class="desc" style="line-height:2.1">
+两个文件夹里都有 <code class="k">Unturned.exe</code>, 光看 exe 分不出来。开服器按<b>三层</b>判:
+<br>· <b>第一层 · Steam 的记录</b>: 读 <code class="k">steamapps\\appmanifest_304930.acf</code>
+(本体) 和 <code class="k">appmanifest_1110390.acf</code> (开服端) 里 Steam 自己记的安装目录。
+这份记录<b>你改不动</b>, 命中就一锤定音 —— Steam 亲装的开服端就算被本体文件污染过也不会误判。<br>
+· <b>第二层 · 目录名</b>: 文件夹叫 <code class="k">U3DS</code> (Steam 默认安装名) 就放行,
+只在本体有 <code class="k">Unturned_BE.exe</code> 时例外 (开服端绝不会有这个文件, 它单独定罪)。<br>
+· <b>第三层 · 运行残留</b>: 名字对不上、也不在 Steam 记录里 (自己拷贝的) 时, 要<b>同时命中两条</b>
+才算本体 —— <code class="k">Unturned_BE.exe</code> /
+<code class="k">steam_appid.txt</code> 写着 304930 / 同时有 <code class="k">Worlds</code> 和
+<code class="k">Preferences.json</code>。<br>
+<span class="hint">只命中一条不定罪, 改成<b>黄字提醒</b>照样放行 —— 整合包里混了几个本体文件是常见事,
+不该因此不让你开服。报错末尾会附上「(本目录实测: …)」把三条判据的实测结果都列出来,
+反馈问题时<b>截那一句</b>就能一眼看出是哪条判据命中的, 不用来回猜。</span></div></div>
+
 <div class="card"><h2>🛒 开服端怎么拿到: 优先用 Steam 商店装</h2>
 <div class="desc" style="line-height:2.1">
 <b>Unturned - Dedicated Server</b> (AppID 1110390) 在 Steam 上是<b>完全免费</b>的, 谁都能点安装,
@@ -5068,13 +6009,52 @@ Steam 会自动把你的<b>游戏本体</b>更新到最新, 但<b>开服端不�
 用「🛒 在 Steam 商店打开开服端」那个按钮随时可以跳过去。</span><br>
 · 版本号是从开服端自己写的日志里读的, 所以这个开服端<b>至少完整跑过一次</b>才读得到</div></div>
 
+<div class="card"><h2>🧩 创意工坊地图: 识别、换图、资产包</h2>
+<div class="desc" style="line-height:2.1">
+<b>怎么识别</b>: 「服务器设置 → 地图」那个下拉框会直接列出<b>本存档已经下载好的创意工坊地图</b>,
+名字后面标着 <code class="k">· 🧩 创意工坊 模组ID</code>, 点一下就填进配置; 旁边的
+<b>「🧩 识别本存档的创意工坊地图」</b>按钮用来<b>不重启页面</b>就地重扫一遍
+(刚下完地图想让下拉框立刻认到, 就点它)。<br>
+· <b>填完模组 ID 必须把服务器启动一遍</b>, 游戏才会真的去下载那张地图 —— 没下载过地图时
+下拉框里不会出现它, 按钮扫出来也会告诉你「本存档还没有下载好的创意工坊地图」<br>
+· 认地图的办法: 存档的 <code class="k">Workshop\\Steam\\content\\304930\\&lt;模组ID&gt;</code> 里
+有 <code class="k">Map.meta</code> 的, 就按它旁边那个文件夹的名字当地图名 (资产包没有
+<code class="k">Map.meta</code>, 不会被错认成地图)<br>
+· <b>换地图等于开一个新档</b>: 建筑不会跟过去、角色数据也不会跟过去。老档<b>不会丢</b> ——
+原地图仍然在存档的 <code class="k">Level\\旧地图名</code> 里, 把地图名换回去就能接着玩。
+真正换图之前开服器会先把这几句弹给你确认, 并写出<b>你当前的服务器存档目录</b><br>
+· <b>用的是创意工坊地图时, 开服成功后会弹一个 10 秒的提醒框</b>: 有些工坊地图还要<b>另外订阅一份
+资产包</b> (也是创意工坊文件), 资产包没到位时地图会加载失败、或者进去是一片空图。
+要不要资产包请到那张地图的创意工坊页面看; 框里会带上你当前的存档目录, 还有一个
+<b>「🧩 在创意工坊打开这张地图」</b>的按钮 (新标签页打开, 不会把这个页面顶掉)</div></div>
+
+<div class="card"><h2>🔧 玩法设置最底下那个「高级配置」(v0.1.14 起)</h2>
+<div class="desc" style="line-height:2.1">
+「玩法设置」页平时看到的 67 项是<b>挑出来最常调的</b>; 官方 Config.txt 里还剩一大把参数没地方填。
+这一版把它们收进了页面最底下的 <b>「🔧 高级配置」</b> —— <b>默认是收起的, 不点开就当它不存在</b>,
+一行代码都不会往存档里写, 原来那一页多长还是多长。<br>
+· 一共 <b>191 项</b>, 分 13 个段落 (玩家 / 僵尸 / 动物 / 载具 / 建筑 / 物品 / 场景物件 / 事件天气 /
+玩法手感 / 服务器 / 模组事件 / 大厅展示), 每项都有中文名和一句人话说明, 顶部还有个<b>关键词筛选框</b>,
+输入「僵尸」「掉落」「Respawn」都能立刻筛到那一堆<br>
+· <b>这一批官方没有公布安全取值范围</b>, 所以开服器只挡住「一定会写坏文件」的填法: 负数、非数字、
+概率大于 1、掉落个数带小数、还有含大括号或注释符号的文字。剩下的一律照你填的写 ——
+<b>不知道该填什么的就留空</b>, 留空 = 这一项交回游戏自己决定<br>
+· <b>这块的保存按钮和上面是分开的</b>: 上面的「保存全部修改」管不到它, 填完要点它自己的
+「💾 保存高级配置」。改过没点保存就切页 / 开服, 一样会被防呆拦下来 (它会报「高级配置」这一组)<br>
+· 文件里原本没有这一笔时, 开服器会<b>把它插进对应的段落</b> (段落都没有就整段补一段),
+而不是像以前那样"写不进去还没人吭声"; 你手动改完后清空并按保存, 那一笔会<b>退回只写键名不带值</b>
+的样子, 也就是交还给游戏默认<br>
+· 涉及账号安全的项<b>有意没有放进来</b>: 登录凭据 <code class="k">Login_Token</code>、
+服务器书签地址、官方服务器与 Steam 测试分支 —— 这几项就算你手动构造请求, 接口那边也会直接拒
+</div></div>
+
 <div class="card"><h2>每个菜单是干什么的</h2>
 <div class="desc" style="line-height:2.1">
 <b>仪表盘</b> — 开服 / 重启 / 关服, 查看服务器代码和基本信息<br>
 <b>一键设置</b> — 最常用的傻瓜开关: 死亡不掉落、建筑无敌、车辆无敌、僵尸不拆家、摔落伤害、组队友伤、空投、出生满技能、<b>无需指南针/GPS/手绘地图也能看方向和地图</b>; 僵尸强度 / 经验倍率 / 物资丰富度 / 天气; 还有 <b>Rocket 指令反馈汉化</b><br>
 <b>服务器设置</b> — 服务器名称、地图、人数、端口、PVP/PVE、<b>难度 (换难度会列出到底改了哪些数值)</b>、视角、进服密码、<b>开启作弊 (cheats on)</b>; 以及<b>启动参数</b>、<b>开服端版本检查与一键更新</b>、<b>Rocket 安装</b>, 页面最底下是 <b>服务器图标与大厅链接 (图床设置)</b><br>
-<b>玩法设置</b> — 进阶参数: 血量、经验、刷怪、刷车、建筑承伤、空投频率、天气等。每一项都标了<b>能填的范围、游戏默认值、0 和 1 分别是什么意思</b>, 超出范围的会被拦下来不让保存<br>
-<b>创意工坊</b> — 填模组 ID 自动下载 Steam 创意工坊模组<br>
+<b>玩法设置</b> — 进阶参数: 血量、经验、刷怪、刷车、建筑承伤、空投频率、天气等。每一项都标了<b>能填的范围、游戏默认值、0 和 1 分别是什么意思</b>, 超出范围的会被拦下来不让保存; 页面最底下还有一个默认收起的 <b>「🔧 高级配置」(191 项, 官方 Config.txt 里剩下的那些参数, 有关键词筛选)</b><br>
+<b>创意工坊</b> — 填模组 ID 自动下载 Steam 创意工坊模组 (已下载的工坊地图会自己出现在「服务器设置」的地图下拉框里)<br>
 <b>存档管理</b> — <b>建筑存档 / 玩家存档</b>的备份与删除 (删除前强制先备份, 位置自己选)<br>
 <b>控制台</b> — 实时日志和报错、发送命令、<b>在线玩家管理</b> (给物品/车辆、传送、踢出；无敌/隐身由玩家自行使用 /god 与 /vanish 指令)、白天/黑夜等快捷指令<br>
 <b>操作日志</b> — 记录你在网页里的每次操作和错误, 出问题先来这里看<br>
@@ -5186,6 +6166,9 @@ Steam 会自动把你的<b>游戏本体</b>更新到最新, 但<b>开服端不�
 (旧版本只认手动输入框, 所以下拉框选了没反应)。保存后本页会显示真实地图名; 地图名探测不到时
 <b>开服会给黄字警告</b>, 不会再一声不响地退回 PEI。创意工坊地图要先在「创意工坊」页订阅才会下载。
 另外<b>换地图等于换一张全新的世界</b>, 老地图的建筑仍然存在 <code class="k">Level\\旧地图名</code> 里, 名字改回去就能看到<br>
+<b>想调的参数「玩法设置」翻遍了也没有?</b> 拉到那一页<b>最底下</b>, 点开默认收起的
+「🔧 高级配置」—— 官方 Config.txt 里剩下的 191 项都在里面, 顶部有关键词筛选框;
+那一块<b>有自己独立的保存按钮</b>, 填完别只点上面那个「保存全部修改」<br>
 <b>设置改了没保存, 切个页面就白改了?</b> 「服务器设置」和「玩法设置」已经加了防呆, 不用再担心保存按钮藏得深:
 只要有改动没保存, 右下角会一直挂着「⚠ 有 N 处修改还没保存」, 改过的卡片描上黄边;
 这时候点侧边栏换页、点「▶ 开服 / 🔄 重启」、甚至刷新网页, 都会先弹窗问你要怎么办 ——
@@ -5599,6 +6582,7 @@ word-break:break-all;margin:8px 0 0}
 def page_setup():
     bound = game_dir()
     bad_dir = check_game_dir(bound) if bound else ""
+    dir_note = "" if bad_dir else client_soft_note(bound)
     gdir = None if bad_dir else bound
     detected = detect_game_dirs()
     if gdir and os.path.normcase(gdir) not in map(os.path.normcase, detected):
@@ -5686,6 +6670,12 @@ def page_setup():
 Servers 下面, 再重新设置一次就能接着用, 数据不会丢。</div>
 </div>""" if bad_dir else ""
 
+    # 目录能用、但里面留着本体的文件: 黄字说清楚, 别等开服崩了才发现
+    note_card = f"""<div class="step" style="border-color:rgba(251,191,36,.45)">
+<h2 style="color:#fbbf24">🟡 这个目录能用, 但有句提醒</h2>
+<div class="desc">{esc(dir_note)}</div>
+</div>""" if dir_note else ""
+
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>初始设置 · Dawn Sharkk</title>
 <script>try{{var t=new URLSearchParams(location.search).get('theme')||localStorage.getItem('untheme');
@@ -5700,6 +6690,7 @@ if(t)localStorage.setItem('untheme',t);}}catch(e){{}}</script>
 <div class="desc">首次使用, 两步完成设置 (保存在本文件夹 settings.json)
 {' · 简装版 v' + VERSION + ' (不含开服端下载)' if LITE else ' · 完整版 v' + VERSION}</div></div></div>
 {bad_card}
+{note_card}
 <div class="step" id="step1">
 <h2>第 1 步 · 选择游戏目录</h2>
 <div class="desc">就是 Unturned 服务器 (U3DS) 所在的文件夹, 里面应该有 Unturned.exe。下面是自动探测到的位置:</div>
@@ -5968,14 +6959,19 @@ class Handler(BaseHTTPRequestHandler):
             gdir = str(body.get("game_dir", "")).strip().strip('"')
             err = check_game_dir(gdir)
             if err:
+                # 拒绑必须留痕: 报错里带着三条判据的实测结果, 用户截一张图就能定位
+                oplog("错误", f"拒绑目录 {gdir}: {err}")
                 return self._json({"ok": False, "msg": err})
             _settings["game_dir"] = gdir
             if instance() and not os.path.isdir(os.path.join(gdir, "Servers", instance())):
                 _settings["instance"] = None
             save_settings()
             oplog("操作", f"设置游戏目录: {gdir}")
+            note = client_soft_note(gdir)
+            if note:
+                oplog("操作", f"目录体检提醒: {note}")
             return self._json({"ok": True, "instances": list_instances(),
-                               "msg": "游戏目录已保存"})
+                               "msg": "游戏目录已保存", "warn": note})
 
         if u.path == "/api/setup/instance":
             err = bound_dir_error()
@@ -6045,7 +7041,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/start":
             ok, msg = start_server()
             oplog("操作", f"点击开服 → {msg}")
-            return self._json({"ok": ok, "msg": msg})
+            return self._json({"ok": ok, "msg": msg, "wsmap": ws_start_notice(ok)})
         if u.path == "/api/stop":
             ok, msg = stop_server()
             oplog("操作", f"点击关服 → {msg}")
@@ -6056,10 +7052,11 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(2)
                 ok2, msg2 = start_server()
                 oplog("操作", f"点击重启 → {msg2}")
-                return self._json({"ok": ok2, "msg": "已关闭, " + msg2})
+                return self._json({"ok": ok2, "msg": "已关闭, " + msg2,
+                                   "wsmap": ws_start_notice(ok2)})
             ok2, msg2 = start_server()
             oplog("操作", f"点击重启 → {msg2}")
-            return self._json({"ok": ok2, "msg": msg2})
+            return self._json({"ok": ok2, "msg": msg2, "wsmap": ws_start_notice(ok2)})
 
         if u.path == "/api/console":
             ok, msg = send_command(str(body.get("cmd", ""))[:500])
@@ -6229,6 +7226,16 @@ class Handler(BaseHTTPRequestHandler):
             oplog("操作", f"保存创意工坊列表 ({len(data['File_IDs'])} 个模组)")
             return self._json({"ok": True})
 
+        if u.path == "/api/maps/workshop":
+            maps = workshop_maps()
+            oplog("操作", f"识别本存档的创意工坊地图: "
+                          + (", ".join("%s(%s)" % (m["map"], m["id"]) for m in maps) or "没识别到"))
+            return self._json({"ok": True, "maps": maps, "dir": server_dir() or "",
+                               "subscribed": len(ws_subscribed_ids()),
+                               "msg": (f"识别到 {len(maps)} 张创意工坊地图" if maps else
+                                       "本存档里还没有下载好的创意工坊地图: 先在「创意工坊」页填 ID, "
+                                       "再把服务器启动一遍让游戏把地图下载下来, 然后回来点这个按钮")})
+
         if u.path == "/api/workshop/info":
             raw = body.get("text") or ""
             ids = ws_extract_ids(raw) if raw else [
@@ -6328,6 +7335,64 @@ class Handler(BaseHTTPRequestHandler):
             msg = f"已写入 {count} 项" + (f", 未识别: {','.join(fail)}" if fail else "")
             oplog("操作", f"保存玩法设置 ({msg})")
             return self._json({"ok": True, "count": count, "msg": msg})
+
+        if u.path == "/api/gameplay/advanced":
+            kv = body.get("kv", {}) or {}
+            clean, errs, bad_ids = {}, [], []
+            for fullkey, val in kv.items():
+                dk = str(fullkey)
+                sp = ADV_SPECS.get(dk)
+                if not sp:
+                    errs.append(f"{dk}: 这一项开服器没有收录, 不能写")
+                    bad_ids.append(dk)
+                    continue
+                if (sp["sec"], sp["key"]) in ADVANCED_DENY:
+                    errs.append(f"{sp['sec_cn']} · {sp['label']}: 涉及登录凭据或官方服务器, 有意不提供")
+                    bad_ids.append(dk)
+                    continue
+                norm, err = adv_check(dk, val)
+                if err:
+                    errs.append(err)
+                    bad_ids.append(dk)
+                else:
+                    clean[dk] = norm
+            if errs:
+                oplog("错误", f"高级配置校验未通过 ({len(errs)} 项): " + " | ".join(errs[:6]))
+                return self._json({"ok": False, "count": 0, "items": bad_ids,
+                                   "msg": "高级配置有 " + str(len(errs)) + " 项填得不对, 这次一个都没写入: "
+                                          + " / ".join(errs[:4])
+                                          + ("…" if len(errs) > 4 else "")})
+            counts = {"set": 0, "new": 0, "skip": 0}
+            fail, path = [], config_txt()
+            cur = cfg_section_keys(path)
+            same = 0
+            for dk, norm in clean.items():
+                if dk.lower() in cur and (cur[dk.lower()] or "") == (norm or ""):
+                    same += 1                     # 值没动过就不碰文件, 免得"保存"虚报项数
+                    continue
+                sec, key = dk.split("|", 1)
+                try:
+                    r = set_cfg_value(path, sec, key, norm)
+                except OSError as e:
+                    r = "fail"
+                    fail.append(f"{key}: {e}")
+                if r in counts:
+                    counts[r] += 1
+                else:
+                    fail.append(key)
+            msg = f"已修改 {counts['set']} 项"
+            if counts["new"]:
+                msg += f", 新增 {counts['new']} 项"
+            if counts["skip"]:
+                msg += f", {counts['skip']} 项交回游戏默认"
+            if same:
+                msg += f" (另有 {same} 项与文件里的值一样, 没动)"
+            if fail:
+                msg += ", 未写入: " + ",".join(fail[:6])
+            oplog("操作", f"保存高级配置 ({msg})")
+            return self._json({"ok": not fail, "count": counts["set"] + counts["new"],
+                               "msg": msg if not fail else "有 " + str(len(fail)) + " 项写不进去: "
+                                    + " / ".join(fail[:4]) + ("…" if len(fail) > 4 else "")})
 
         if u.path == "/api/manager/shutdown":
             oplog("操作", "从网页关闭开服器程序")
