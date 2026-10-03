@@ -32,7 +32,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 OPLOG_PATH = os.path.join(BASE_DIR, "操作日志.txt")
 HOST, PORT = "127.0.0.1", 8787
-VERSION = "0.1.14"           # 发布版本号: 改这里 + 新增 更新内容-版本号.md + 跑 发布打包.py
+VERSION = "0.1.17"           # 发布版本号: 改这里 + 新增 更新内容-版本号.md + 跑 发布打包.py
 # 发行版本: full = 完整版 (自带 SteamCMD 下载开服端)。从 v0.1.12 起只发完整版 ——
 # 自带的工具才 1.6 MB, 再单独出一份"没有下载功能"的简装版没意义。
 # lite 分支的代码保留, 只为兼容手里还拿着旧简装包的人。
@@ -335,11 +335,34 @@ def list_instances():
 
 
 INSTANCE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+# 存档名会原样进开服命令行 (+Secureserver/存档名), 新建时仍要英文; 但 Servers 下
+# 已经存在的文件夹就是一个存档 (别人给的、游戏里建的都可能叫中文), 选中它不该被拦。
+NAME_BAD_CHARS = set('/\\:*?"<>|\r\n\t')
+
+
+def existing_instance_ok(name):
+    """已存在的存档目录名能不能用: 允许中文, 只挡路径符号和越界写法"""
+    n = (name or "").strip()
+    if not n or len(n) > 32 or n in (".", ".."):
+        return False
+    if any(c in NAME_BAD_CHARS for c in n):
+        return False
+    return n == os.path.basename(n)
+
+
+def non_ascii_name_hint(name):
+    """非英文存档名的风险提醒 (英文 Windows 上比对启动命令行会糊, 表现为关不掉服)"""
+    if ascii_path(name):
+        return ""
+    return ("这个存档的名字里有中文或其他非英文字符。开服器读写它的配置没问题; "
+            "但服务器「在不在运行 / 能不能关掉」靠比对游戏启动命令行判断, "
+            "少数非中文系统的 Windows 上这行字会被显示成一串问号而认不出来 —— "
+            "真碰上关不掉服务器, 把 Servers\\" + str(name) + " 改名成英文就好, 里面的数据不用动。")
 
 
 def create_instance(name):
     if not INSTANCE_NAME_RE.match(name or ""):
-        return False, "存档名只能用英文字母、数字、- 和 _ (1~32 字符)"
+        return False, "新建存档的名字只能用英文字母、数字、- 和 _ (1~32 字符)"
     base = os.path.join(game_dir(), "Servers", name)
     if os.path.isdir(base):
         return False, "这个存档名已经存在"
@@ -512,7 +535,7 @@ def scan_dedi_installs():
         except OSError:
             n_inst, mt = 0, 0
         found.append({"path": p, "instances": n_inst,
-                      "rocket": os.path.isdir(os.path.join(p, "Modules", "Rocket.Unturned")),
+                      "rocket": p and rocket_check(p)["installed"],
                       "time": time.strftime("%Y-%m-%d", time.localtime(mt)) if mt else ""})
 
     for p in detect_game_dirs():
@@ -1588,10 +1611,8 @@ GAMEPLAY_FIELDS = [
          "玩家延迟超过多少毫秒就请他出去。原版 750 对国内联机太狠了, 建议 1500~2000, 不然朋友进不来。"),
         ("Timeout_Game_Seconds", "无响应踢出(秒)", "number", "", (1, 600, 20),
          "客户端多久不回话就判定掉线踢出。网络不稳可以把这一项调大一点, 太小会频繁被踢。"),
-        ("VAC_Secure", "VAC 反作弊", "bool", "", (None, None, True),
-         "开 = 走 Steam 的 VAC 反作弊。关掉等于欢迎开挂的进来, 不建议动。"),
-        ("BattlEye_Secure", "BattlEye 反作弊", "bool", "不建议关闭", (None, None, True),
-         "开 = 走 BattlEye 服务端反作弊。关了挂哥会变多, 只有排查误封时才临时关一下。"),
+        # VAC_Secure / BattlEye_Secure 从 v0.1.17 起挪到「服务器设置」页那张反作弊卡片单独管:
+        # 同一个键在两个页面各有一份表单值, 后保存的会把先改的覆盖回去
     ]),
 ]
 
@@ -2962,10 +2983,25 @@ def start_server():
     return True, ("服务器启动中, 大约需要 30~60 秒, 可到「控制台」页看进度" + warn)
 
 
-def find_server_pids():
-    """按启动参数精确找到本存档的 Unturned 服务器进程 (不会误伤正在玩的游戏客户端)"""
-    pids = []
-    inst = instance()
+def _procs_powershell():
+    """[(pid, 命令行)] 走 PowerShell 的 Get-CimInstance; 拿不到返回 None (不是空列表)"""
+    q = ('Get-CimInstance Win32_Process -Filter "Name=\'Unturned.exe\'" | '
+         'ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }')
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", q],
+                           capture_output=True, timeout=25)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    rows = []
+    for line in (r.stdout or b"").decode("gbk", "replace").splitlines():
+        pid, _, cl = line.partition("\t")
+        if pid.strip().isdigit():
+            rows.append((int(pid.strip()), cl.strip()))
+    return rows if r.returncode == 0 else None
+
+
+def _procs_wmic():
+    """老路子, 留着当加速: Windows 11 24H2 起 wmic 已被微软退役, 精简/破解系统通常直接没有"""
     try:
         r = subprocess.run(
             ["wmic", "process", "where", "name='Unturned.exe'",
@@ -2973,16 +3009,59 @@ def find_server_pids():
             capture_output=True, timeout=20)
         txt = r.stdout.decode("gbk", "replace")
     except (OSError, subprocess.TimeoutExpired):
-        return pids
+        return None
+    if r.returncode:
+        return None
+    rows = []
     for line in txt.splitlines():
         line = line.strip()
         if not line or line.startswith("Node,"):
             continue
-        if inst and inst in line and ("+InternetServer/" in line or "+Secureserver/" in line
-                                      or "+LanServer/" in line):
-            m = re.search(r",\s*\"?(\d+)\"?\s*$", line)
-            if m:
-                pids.append(int(m.group(1)))
+        m = re.search(r",\s*\"?(\d+)\"?\s*$", line)
+        if not m:
+            continue
+        cl = re.sub(r"^Node,[^,]*,", "", line)
+        cl = re.sub(r",\s*\"?\d+\"?\s*$", "", cl).strip().strip('"')
+        rows.append((int(m.group(1)), cl))
+    return rows
+
+
+def unturned_procs():
+    """机器上所有 Unturned.exe: [(pid, 命令行)]; 命令行取不到时是空串
+
+    三条路依次试: PowerShell → wmic → tasklist。tasklist 只能给 PID, 所以那种情况下
+    调用方拿不到"这是哪个存档", 只能按名字粗判 —— 绝不能凭这个去强杀 (会误伤游戏客户端)。
+    """
+    for how in (_procs_powershell, _procs_wmic):
+        rows = how()
+        if rows is not None:
+            return rows
+    rows = []
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Unturned.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, timeout=15).stdout.decode("gbk", "replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return rows
+    for line in out.splitlines():
+        f = re.findall(r'"([^"]*)"', line)
+        if len(f) >= 2 and f[0].lower() == "unturned.exe" and f[1].isdigit():
+            rows.append((int(f[1]), ""))
+    return rows
+
+
+def find_server_pids():
+    """按启动参数精确找到本存档的 Unturned 服务器进程 (不会误伤正在玩的游戏客户端)"""
+    inst = instance()
+    pids = []
+    if not inst:
+        return pids
+    for pid, cl in unturned_procs():
+        if not cl:
+            continue
+        if inst in cl and any(s in cl for s in ("+InternetServer/", "+Secureserver/",
+                                                "+LanServer/")):
+            pids.append(pid)
     return pids
 
 
@@ -3017,6 +3096,54 @@ def adopt_rcon():
                                   "port": port, "password": pw}
 
 
+def _relay_proc():
+    with _proc_lock:
+        return _proc
+
+
+def _game_gone():
+    """本存档的 Unturned 进程是否已经退出 (True=已经没了)
+
+    命令行读不到时 (tasklist 兜底) 一律按「还在跑」处理, 免得误判成已关服。
+    """
+    if find_server_pids():
+        return False
+    rows = unturned_procs()
+    if rows and all(not cl for _, cl in rows):
+        return False
+    return True
+
+
+def _wait_gone(cap):
+    """等服务器自己退出 (shutdown 会先保存世界, 存档大时要等一会儿)"""
+    t0 = time.time()
+    while time.time() - t0 < cap:
+        time.sleep(2)
+        if _game_gone():
+            return True
+    return False
+
+
+def _reap_relay():
+    """关掉控制台中继窗口 (reader.py), 并清掉窗口标题用的临时文件"""
+    helper = _relay_proc()
+    if helper is not None and helper.poll() is None:
+        try:
+            helper.kill()
+        except OSError:
+            pass
+    try:
+        os.remove(os.path.join(server_dir(), "title.tmp"))
+    except OSError:
+        pass
+
+
+def _after_stop():
+    _reap_relay()
+    restore_rcon()
+    _srv_check["t"] = 0
+
+
 def stop_server():
     running, pid = server_running()
     if not running:
@@ -3024,34 +3151,36 @@ def stop_server():
     # 优先安全关服: RCON shutdown 会自动保存世界 (含接管此前已启用的 RCON)
     if not _rcon_cfg:
         adopt_rcon()
+    sent = False
     if _rcon_cfg:
         try:
             rcon_command("shutdown")
-            for _ in range(15):
-                time.sleep(2)
-                if not server_running()[0]:
-                    restore_rcon()
-                    _log("—— 服务器已安全关闭, 世界已保存", "sys")
-                    return True, "✅ 已安全关闭, 世界已保存"
-        except (OSError, RconError):
-            pass
+            sent = True
+        except (OSError, RconError) as e:
+            why, ev = rcon_diag()
+            oplog("错误", f"安全关服命令没送达: {e} | {ev['evidence']}")
+            _log(f"—— 安全关服命令没能送进去: {why}", "sys")
+    if sent:
+        if _wait_gone(90):
+            _after_stop()
+            _log("—— 服务器已安全关闭, 世界已保存", "sys")
+            return True, "✅ 已安全关闭, 世界已保存"
+        # 命令已经进去了, 只是游戏还没退 —— 这时候强杀会丢存档
+        return False, ("⏳ shutdown 命令已经发出去了, 但等了 90 秒服务器还没退出。"
+                       "世界可能正在保存 (存档大时会更久), 请再等一会儿再点关服; "
+                       "如果黑色控制台窗口还开着, 也可以直接在那个窗口里输入 shutdown")
     # 兜底: 只精确结束本存档的服务器进程 (不会误伤正在玩的 Unturned 游戏客户端)
     pids = find_server_pids()
-    if not pids:
-        return False, "没有找到本存档的服务器进程 (如果只开着 Unturned 游戏客户端, 不会被关闭)"
     for p in pids:
         subprocess.run(["taskkill", "/PID", str(p), "/F"], capture_output=True)
-    with _proc_lock:
-        helper = _proc
-    if helper is not None and helper.poll() is None:
-        try:
-            helper.kill()   # 控制台中继器随服务器退出
-        except OSError:
-            pass
-    restore_rcon()
-    _srv_check["t"] = 0
-    _log("—— 服务器已被强制关闭", "sys")
-    return True, "已强制关闭 (未保存世界。下次请先在控制台执行 save 或直接点关服按钮)"
+    _after_stop()
+    if pids:
+        _log("—— 服务器已被强制关闭", "sys")
+        return True, "已强制关闭 (未保存世界。下次请先在控制台执行 save 或直接点关服按钮)"
+    _log("—— 机器上没有本存档的 Unturned 进程, 已关闭控制台中继窗口", "sys")
+    return True, ("已关掉本开服器的控制台窗口, 但机器上并没有找到本存档的 Unturned 进程 —— "
+                  "服务器通常是已经自己崩了 (常见原因: Rocket 没装好、目录混装了游戏本体文件)。"
+                  "请到「运行日志」看最后几行, 按「控制台」页的提示修复 Rocket 后重新开服")
 
 
 # ================================================================ RCON (控制台命令发送)
@@ -3065,24 +3194,38 @@ class RconError(Exception):
     pass
 
 
-def _rcon_recv(sock, quiet):
-    buf = b""
-    end = time.time() + quiet
-    while time.time() < end:
+def _rcon_recv(sock, quiet, cap=20.0):
+    """读到「连续 quiet 秒没有新内容」或服务器主动断链为止, 总时长不超过 cap 秒"""
+    buf, t0, last = b"", time.time(), time.time()
+    try:
+        sock.settimeout(1.0)
+    except OSError:
+        pass
+    while time.time() - last < quiet and time.time() - t0 < cap:
         try:
             d = sock.recv(4096)
-            if not d:
-                break
-            buf += d
-            end = time.time() + quiet
-        except (socket.timeout, OSError):
+        except socket.timeout:
+            continue
+        except OSError:
             break
+        if not d:
+            break                       # 服务器把这个连接关掉了: 回执到此为止
+        buf += d
+        last = time.time()
     return buf.decode("utf-8", "replace")
 
 
-def rcon_command(cmd):
+# 这些命令要先把世界存下来才回话, 等短了就会「命令执行了、回执没收到」
+SLOW_COMMANDS = ("shutdown", "save", "exit", "reload", "restart", "saveworld")
+
+
+def rcon_command(cmd, slow=None):
+    if not _rcon_cfg:
+        adopt_rcon()      # 开服器重启过、服务器还在跑: 从存档配置里把 RCON 接回来
     if not _rcon_cfg:
         raise RconError("RCON 未启用")
+    if slow is None:
+        slow = (cmd.strip().split() or [""])[0].lower() in SLOW_COMMANDS
     sock = socket.create_connection(("127.0.0.1", _rcon_cfg["port"]), timeout=3)
     try:
         sock.settimeout(3)
@@ -3093,16 +3236,103 @@ def rcon_command(cmd):
                 raise RconError("连接被服务器关闭")
             buf += d
         sock.sendall(b"login " + _rcon_cfg["password"].encode("utf-8") + b"\n")
-        resp = _rcon_recv(sock, 1.0)
+        resp = _rcon_recv(sock, 1.0, 6.0)
         if "error" in resp.lower() or "denied" in resp.lower():
             raise RconError(resp.strip() or "登录失败")
         sock.sendall(cmd.encode("utf-8") + b"\n")
-        return _rcon_recv(sock, 1.5).strip()
+        # 存盘类命令给足时间: 提前 close 会让 Rocket 写回执时报
+        # ObjectDisposedException (真机 Rocket.log 里两次 shutdown 都是这个)
+        return _rcon_recv(sock, 6.0 if slow else 1.5, 60.0 if slow else 8.0).strip()
     finally:
         try:
             sock.close()
         except OSError:
             pass
+
+
+def _port_open(port, timeout=0.6):
+    """这个端口到底有没有人在监听 (TCP 连得上)"""
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _file_age(path):
+    """这个文件多少秒没更新过了; 文件不存在返回 None"""
+    try:
+        return max(0.0, time.time() - os.path.getmtime(path))
+    except OSError:
+        return None
+
+
+def rocket_cfg_enabled():
+    """本存档 Rocket 配置里 RCON 的 Enabled 是什么: True / False / None(读不到)"""
+    sd = server_dir()
+    path = os.path.join(sd, "Rocket", "Rocket.config.xml") if sd else None
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        text, _ = read_file(path)
+    except OSError:
+        return None
+    m = re.search(r"<RCON\b[^>]*>", text)
+    if not m:
+        return None
+    a = re.search(r'Enabled="([^"]*)"', m.group(0))
+    return (a.group(1) or "false").lower() == "true" if a else None
+
+
+def rcon_diag(port=None):
+    """RCON 连不上时先体检, 把"为什么"说清楚, 而不是让人干等一分钟再试。
+
+    真机反馈过的现场是: 网页显示 Rocket 已安装、日志确实在滚, 但每条指令都
+    [WinError 10061] —— 那是 TCP 层就没人监听, 跟"还在启动"没关系。
+    返回 (一句结论, 证据 dict), 证据 dict 也会进操作日志, 截一张图就能定位。
+    """
+    port = port or (_rcon_cfg or {}).get("port") or 27115
+    sd = server_dir()
+    rk = rocket_check()
+    listening = _port_open(port)
+    age_rocket = _file_age(os.path.join(sd, "Rocket", "Logs", "Rocket.log")) if sd else None
+    age_console = _file_age(os.path.join(sd, "console.log")) if sd else None
+    procs = unturned_procs()
+    ev = {"port": port, "listening": listening, "rocket_ok": rk["installed"],
+          "rocket_detail": rk["detail"], "rocket_cfg": rocket_cfg_enabled(),
+          "rocket_log_age": None if age_rocket is None else int(age_rocket),
+          "console_age": None if age_console is None else int(age_console),
+          "unturned": len(procs)}
+    def age_txt(v):
+        return "没有这个文件" if v is None else f"{v} 秒前"
+    line = (f"端口 {port} {'有人监听' if listening else '没人监听'} | "
+            f"Rocket: {rk['detail']} | 配置 Enabled="
+            + ("开" if ev["rocket_cfg"] else "关" if ev["rocket_cfg"] is False else "读不到")
+            + " | Rocket 日志 " + age_txt(ev["rocket_log_age"])
+            + " | 控制台日志 " + age_txt(ev["console_age"])
+            + f" | 机器上 Unturned.exe {len(procs)} 个")
+    ev["evidence"] = line
+    if listening:
+        return ("端口是通的, 那是密码或版本对不上 —— 把下面这行证据发过来", ev)
+    if not rk["installed"]:
+        return ("这次服务器根本没加载 Rocket: " + rk["detail"]
+                + " —— 控制台指令、刷新玩家列表、安全关服都依赖它, 所以全部失败。"
+                "去「服务器设置」页最底下点「一键安装 Rocket」(或手动双击游戏目录 Extras 里的"
+                " Install Rocket.bat), 装完重启服务器", ev)
+    if not procs:
+        return ("机器上已经没有 Unturned.exe 进程了 —— 服务器其实早就退出或崩了, "
+                "网页显示运行中是因为那个黑色控制台窗口(中继器)还开着。"
+                "请到黑色窗口看最后几行报错", ev)
+    if age_rocket is None or (age_console is not None and age_rocket > age_console + 5):
+        return ("Rocket 文件是齐的, 但这次开服它一行日志都没写 —— 游戏没加载它。"
+                "最常见的原因就是这份开服端里混了游戏本体的文件 "
+                "(会抛 NullReferenceException at SDG.Unturned.Assets.Update()), "
+                "或者 Modules 里的 dll 和这个开服端版本不配套", ev)
+    if ev["rocket_cfg"] is False:
+        return ("Rocket 配置里 RCON 是关闭的 —— 存档里已有的 Rocket.config.xml 把我们写的"
+                "配置覆盖掉了, 请把本存档 Rocket 文件夹里的 Rocket.config.xml 备份后删掉再重启", ev)
+    return ("Rocket 看起来是好的, 但端口没人听 —— 可能还在启动中, 过 30 秒再试一次", ev)
 
 
 def patch_rcon():
@@ -3190,7 +3420,9 @@ def send_command(cmd):
     try:
         resp = rcon_command(cmd.strip())
     except (OSError, RconError) as e:
-        return False, f"发送失败: {e} (服务器可能还在启动, 等 1 分钟再试)"
+        why, ev = rcon_diag()
+        oplog("错误", f"命令发送失败: {e} | {ev['evidence']}")
+        return False, f"发送失败: {e} —— {why}"
     _log(f">>> {cmd.strip()}", "cmd")
     for ln in resp.splitlines():
         if ln.strip():
@@ -3215,37 +3447,165 @@ def save_launch_cfg(lc):
     save_settings()
 
 
+# 反作弊两项从 v0.1.17 起只在「服务器设置」页那一张开 (玩法设置里同名的两项已撤掉),
+# 免得同一个键在两个页面各有一份旧值, 后保存的那次把先改的覆盖回去。
+ANTICHEAT_KEYS = {"vac": "VAC_Secure", "be": "BattlEye_Secure"}
+ANTICHEAT_CN = {"vac": "VAC 反作弊", "be": "BattlEye (战眼) 反作弊"}
+
+
+def anticheat_on(which):
+    """当前存档 Config.txt 里这一项反作弊开没开 (文件里没写这一笔 = 游戏默认 = 开启)"""
+    key = ANTICHEAT_KEYS[which]
+    try:
+        val = get_cfg(config_txt(), "Server", key)
+    except OSError:
+        return True
+    return (val or "True").strip().lower() != "false"
+
+
+def set_anticheat(which, on):
+    """写 Config.txt 的 Server/VAC_Secure 或 Server/BattlEye_Secure; 返回 (是否成功, 提示)"""
+    key = ANTICHEAT_KEYS[which]
+    try:
+        r = set_cfg_value(config_txt(), "Server", key, "True" if on else "False")
+    except OSError as e:
+        return False, str(e)
+    if r == "fail":
+        return False, "没写进去 —— 当前存档的 Config.txt 里找不到 Server 段, 请用「文件管理」直接改"
+    oplog("操作", f"{'开启' if on else '关闭'}{ANTICHEAT_CN[which]} (Config.txt {key}={r})")
+    if on:
+        return True, f"已开启 {ANTICHEAT_CN[which]}, 重启服务器后生效"
+    return True, (f"已关闭 {ANTICHEAT_CN[which]} —— 作弊玩家进服不会被拦, "
+                  f"建筑和进度有被乱改的风险, 处理完记得开回来 (重启服务器生效)")
+
+
+# 游戏加载 Rocket 必需的文件 —— 少任何一个, 游戏不会报错, 只是静默不加载 Rocket,
+# 于是 RCON 端口根本没人监听 (网页上表现为「控制台连不上 / 刷不出玩家 / 关不掉服」)。
+ROCKET_REQUIRED = ("Rocket.Unturned.dll", "Rocket.Core.dll", "Rocket.API.dll",
+                   "Rocket.Unturned.module")
+
+
+def rocket_dir(gdir=None):
+    g = gdir or game_dir()
+    return os.path.join(g, "Modules", "Rocket.Unturned") if g else None
+
+
+def rocket_src_dir(gdir=None):
+    g = gdir or game_dir()
+    return os.path.join(g, "Extras", "Rocket.Unturned") if g else None
+
+
+def _dir_files(p):
+    """目录里的 {文件名: 字节数}; 目录不存在或读不到返回 {}"""
+    if not p:
+        return {}
+    try:
+        return {n: os.path.getsize(os.path.join(p, n))
+                for n in os.listdir(p) if os.path.isfile(os.path.join(p, n))}
+    except OSError:
+        return {}
+
+
+def rocket_check(gdir=None):
+    """Rocket 到底装没装好: 看必需文件在不在、是不是空的, 不看「Modules 下有没有那个文件夹」。
+
+    旧版只判 isdir, 于是半装 (xcopy 被杀软拦下一半 / Extras 里根本没有源文件) 也报「已安装」,
+    游戏静默不加载 Rocket —— 用户看到界面说正常, 控制台却永远连不上。
+    """
+    have = _dir_files(rocket_dir(gdir))
+    src = _dir_files(rocket_src_dir(gdir))
+    missing = [n for n in ROCKET_REQUIRED if have.get(n, 0) <= 0]
+    # 与官方 Extras 源文件大小不一致: 只当提示, 不算没装 (有人自己换过新版 Rocket 的 dll)
+    stale = [n for n in sorted(src) if n in have and src[n] != have[n]]
+    installed = not missing
+    if installed:
+        detail = f"必需文件齐 ({len(have)} 个)"
+    elif have:
+        detail = "目录里有 " + str(len(have)) + " 个文件, 但缺 " + "、".join(missing)
+    else:
+        detail = "Modules\\Rocket.Unturned 是空的 (或不存在)" if src else \
+            "Modules\\Rocket.Unturned 不存在"
+    return {"installed": installed, "missing": missing, "stale": stale,
+            "files": len(have), "src": len(src), "detail": detail}
+
+
 def rocket_installed():
     g = game_dir()
-    return bool(g) and os.path.isdir(os.path.join(g, "Modules", "Rocket.Unturned"))
+    return bool(g) and rocket_check(g)["installed"]
 
 
 def rocket_status():
-    """Rocket 前置状态: 是否已安装 / 游戏目录里是否有官方安装脚本"""
+    """Rocket 前置状态: 是否真能加载 / 游戏目录里有没有官方安装脚本和源文件"""
     if not game_dir():
-        return {"installed": False, "bat": False}
-    g = game_dir()
-    return {"installed": rocket_installed(),
-            "bat": os.path.isfile(os.path.join(g, "Extras", "Install Rocket.bat"))}
+        return {"installed": False, "bat": False, "src": 0, "missing": [], "stale": [],
+                "files": 0, "detail": "还没绑定游戏目录"}
+    st = rocket_check()
+    st["bat"] = os.path.isfile(os.path.join(game_dir(), "Extras", "Install Rocket.bat"))
+    return st
+
+
+def rocket_problem():
+    """没装好时的一句人话; 装好了返回空串"""
+    st = rocket_status()
+    if st["installed"]:
+        return ""
+    if not st["src"]:
+        return ("游戏目录 Extras 里没有 Rocket.Unturned 这个文件夹 —— 官方安装脚本没了源文件, "
+                "跑它也是复制 0 个文件。请在 Steam 库右键开服端 → 管理 → 验证游戏文件完整性, "
+                "再回来重装 Rocket")
+    return "Rocket 没装好: " + st["detail"]
+
+
+def _rocket_manual_hint(why):
+    return (f"{why} 可以先手动双击游戏目录 Extras 里的「Install Rocket.bat」"
+            "(弹出的黑窗口按一下回车就跑完了), 回来点「🔄 重新检测」。"
+            "反复这样多半是杀软或 Windows「受控文件夹访问」拦住了往 Steam 目录写 dll —— "
+            "临时放行再装一次")
 
 
 def install_rocket():
-    """运行 Extras\Install Rocket.bat 安装/重装 Rocket"""
-    bat = os.path.join(game_dir(), "Extras", "Install Rocket.bat")
+    """运行 Extras\\Install Rocket.bat 安装/重装 Rocket。
+
+    bat 里那句 xcopy 一个文件没复制也会返回 0, 所以成败只看必需文件有没有真的落地。
+    """
+    g = game_dir()
+    if not g:
+        return False, "还没有绑定游戏目录"
+    bat = os.path.join(g, "Extras", "Install Rocket.bat")
     if not os.path.isfile(bat):
-        return False, "找不到 Extras\\Install Rocket.bat (请先通过 Steam 校验游戏完整性)"
+        return False, ("找不到 Extras\\Install Rocket.bat —— 请在 Steam 库右键开服端 → 管理 → "
+                       "验证游戏文件完整性, 再回来重装")
+    if not _dir_files(rocket_src_dir()):
+        return False, (rocket_problem() or
+                       ("Extras 里没有 Rocket.Unturned 源文件夹, 跑安装脚本只会复制 0 个文件 —— "
+                        "Modules 里已经装好的 " + str(rocket_check()["files"]) + " 个文件不受影响, "
+                        "但想重装/更新的话, 请先在 Steam 库右键开服端 → 管理 → 验证游戏文件完整性"))
     try:
         r = subprocess.run([bat], cwd=os.path.dirname(bat), capture_output=True,
                            stdin=subprocess.DEVNULL, timeout=180)
-        out = (r.stdout or b"").decode("gbk", "replace")
+        out = ((r.stdout or b"") + (r.stderr or b"")).decode("gbk", "replace")
     except (OSError, subprocess.TimeoutExpired) as e:
         oplog("错误", f"Rocket 安装失败: {e}")
-        return False, f"安装失败: {e}"
-    ok = rocket_installed()
-    oplog("操作", f"Rocket 安装{'完成' if ok else '异常'}: {out.strip()[:120]}")
-    if ok:
-        return True, "Rocket 安装/更新完成, 重启服务器后生效"
-    return False, "安装脚本已执行, 但未检测到 Modules\\Rocket.Unturned, 请截图命令框报错反馈"
+        return False, _rocket_manual_hint(f"安装脚本没能跑起来: {e}")
+    st = rocket_check()
+    src = _dir_files(rocket_src_dir())
+    after = _dir_files(rocket_dir())
+    same = sum(1 for n, s in src.items() if after.get(n) == s)
+    denied = re.search(r"拒绝访问|Access is denied|not enough (memory|space)|内存不足|磁盘空间不足",
+                       out, re.I)
+    copied = re.search(r"(?:复制了|Copied)\s*[:：]?\s*(\d+)", out, re.I)
+    oplog("操作", f"Rocket 安装脚本跑完: 必需文件齐={not st['missing']} 与官方源一致={same}/"
+                  f"{len(src)} xcopy报复制={copied.group(1) if copied else '?'} "
+                  f"返回码={r.returncode}" + (f" 拦截={denied.group(0)}" if denied else ""))
+    if st["installed"] and not st["stale"]:
+        return True, f"Rocket 安装/更新完成 (与官方源一致的有 {same} 个), 重启服务器后生效"
+    if st["installed"]:
+        return True, ("Rocket 必需文件已齐, 重启服务器后生效。另有 "
+                      + str(len(st["stale"])) + " 个文件与官方 Extras 里的大小不同 —— "
+                      "如果是你自己换过新版 Rocket 就没事")
+    return False, _rocket_manual_hint(
+        ("复制时被系统拦住了 (" + denied.group(0) + ") —— " if denied else "官方脚本跑完了、返回码也是 0, 但 ")
+        + "Rocket 仍然没装好: " + st["detail"] + "。")
 
 
 # ------------------------------------------------- Rocket 指令反馈汉化 (不是汉化控制台日志)
@@ -3991,6 +4351,18 @@ color:var(--acc2);user-select:none;display:flex;align-items:center;gap:9px;flex-
 .advbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 6px 13px}
 .advfilter{flex:1 1 250px;min-width:190px}
 .advhide{display:none !important}
+/* 启动参数: 默认收起 + 红色边框 (和帮助页置顶那个框同一套警告色) */
+.advbox.sosbox{border-color:var(--bad);border-left:5px solid var(--bad);background:
+linear-gradient(135deg,rgba(239,68,68,.10),rgba(255,255,255,.02) 45%)}
+html.light .advbox.sosbox{background:linear-gradient(135deg,rgba(194,38,38,.08),rgba(255,255,255,.6) 45%)}
+.advbox.sosbox>summary{color:var(--bad)}
+.advbox.sosbox[open]>summary{border-bottom-color:rgba(239,68,68,.4)}
+.advbox.dirty{box-shadow:0 0 0 1.5px rgba(234,179,8,.55)}
+/* 顶栏「进不去服帮助」: 红底白字 */
+.chip.sosbtn{background:var(--bad);border-color:var(--bad);color:#fff;font-weight:700;
+cursor:pointer;transition:filter .18s,transform .18s}
+.chip.sosbtn:hover{filter:brightness(1.14);transform:translateY(-1px)}
+html.light .chip.sosbtn{background:var(--bad);border-color:var(--bad);color:#fff}
 /* steamcmd 进度条 (初始设置下载 / 服务器设置更新 共用) */
 .bar{height:9px;border-radius:999px;background:var(--line);overflow:hidden;margin:12px 0 6px}
 .bar i{display:block;height:100%;width:0;border-radius:999px;transition:width .6s;
@@ -4408,11 +4780,15 @@ async function doRocketInstall(){
  toast(r.msg,r.ok?0:1);refreshStatus();return r;}
 function openRocket(){
  var s=(lastStatus&&lastStatus.rocket)||{};
- if(s.installed){toast('Rocket 前置插件已安装 🚀 插件 dll 放进存档的 Rocket/Plugins 文件夹即可');return;}
+ if(s.installed){toast('Rocket 已装好: 必需文件齐 (目录里 '+s.files+' 个文件) —— '
+   +'插件 dll 放进存档的 Rocket/Plugins 文件夹即可',0);return;}
  if(!s.bat){toast('游戏目录 Extras 里没有 Install Rocket.bat — 请先在 Steam 校验游戏完整性',1);return;}
+ if(!s.src){toast('Extras 里有安装脚本, 但没有 Rocket.Unturned 这个源文件夹 —— '
+   +'跑脚本也只会复制 0 个文件。请在 Steam 库右键开服端 → 管理 → 验证游戏文件完整性, 再回来重装',1);return;}
  rocketChoice('如需使用更多功能请开启 Rocket 前置插件',
   '开启 Rocket 前置插件后可加载 .dll 插件、使用 RCON 指令与玩家管理等功能。'+
-  '将运行游戏自带 Extras 里的 Install Rocket.bat 完成安装, 装完重启服务器生效。')
+  '当前状态: '+(s.detail||'没装好')+'。将运行游戏自带 Extras 里的 Install Rocket.bat 完成安装, '+
+  '装完重启服务器生效。')
  .then(function(go){if(go)doRocketInstall();else sessionStorage.setItem('rkIgnored','1');});}
 var lastStatus=null;
 async function refreshStatus(){
@@ -4437,10 +4813,13 @@ async function refreshStatus(){
  var lk=document.getElementById('codelink');
  if(lk)lk.style.display=d.code?'':'none';}
  var rk=document.getElementById('rkchip');
- if(rk&&d.rocket){rk.textContent=d.rocket.installed?'🚀 Rocket 已装':'🚀 Rocket 未安装';
- rk.className='chip'+(d.rocket.installed?'':' warnch');}
+ if(rk&&d.rocket){rk.textContent=d.rocket.installed?'🚀 Rocket 已装':'🚀 Rocket 没装好';
+  rk.title='Rocket 文件目录: '+(d.rocket.detail||'')+
+   (d.rocket.stale&&d.rocket.stale.length?(' (有 '+d.rocket.stale.length+' 个文件与 Extras 自带的大小不一致)'):'');
+  rk.className='chip'+(d.rocket.installed?'':' warnch');}
  var rk2=document.getElementById('st-rk');
- if(rk2&&d.rocket)rk2.textContent=d.rocket.installed?'✅ 已安装':'⭕ 未安装';
+ if(rk2&&d.rocket){rk2.textContent=d.rocket.installed?'✅ 已装好':'⭕ 没装好';
+  rk2.title=d.rocket.detail||'';}
  var st=document.getElementById('st-port');
  if(st&&d.port)st.textContent=d.port;
  var ch=document.getElementById('st-cheat');
@@ -4533,7 +4912,7 @@ DIRTY_JS = """
   document.querySelectorAll('[data-grp]').forEach(function(nd){nd.classList.remove('dirty');});
   if(!d.length){pill.style.display='none';return;}
   d.forEach(function(g){document.querySelectorAll(g.sel).forEach(function(nd){
-   if(nd.classList.contains('card'))nd.classList.add('dirty');});});
+   if(nd.classList.contains('card')||nd.classList.contains('advbox'))nd.classList.add('dirty');});});
   pb.textContent='⚠ 有 '+d.length+' 处修改还没保存';
   ps.textContent=d.map(function(g){return g.name;}).join(' · ');
   pill.style.display='';}
@@ -4630,6 +5009,9 @@ def shell(page, title, content, script="", dirty=False):
             f' · <a href="/api/logout">退出登录</a><br>'
             f'<a href="#" onclick="closeManager();return false">关闭开服器程序</a><br>'
             f'<span class="dot" id="dot"></span><span id="foot-st">检测中…</span>')
+    sos_btn = ("" if page == "help" else
+               '<a class="chip sosbtn" href="/help" title="进不去服务器 / 游戏弹报错: '
+               '帮助页置顶那四条对照着解决">🚨 进不去服帮助</a>')
     return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="icon" href="/logo.png">
@@ -4651,6 +5033,7 @@ if(t)localStorage.setItem('untheme',t);}}catch(e){{}}</script>
 <div class="pagehead"><h1>{title}</h1>
 <span class="chip" id="chip">检测中…</span>
 <span class="chip" id="rkchip" onclick="openRocket()" title="Rocket 前置插件状态, 点击查看/开启" style="cursor:pointer">🚀 检测中…</span>
+{sos_btn}
 <span style="flex:1"></span>
 <button class="btn green" data-act="start" data-show-stop>▶ 开服</button>
 <button class="btn gray" data-act="restart" data-show-run>🔄 重启</button>
@@ -4682,7 +5065,7 @@ def page_dash():
     cheat_check = check_html(cheat_on, onchange='onchange="setCheat(this)"',
                              ident="d_cheat", cls="ck-lg")
     content = f"""
-<div class="banner warn" id="rkban" style="display:none">🚀 未检测到 Rocket 前置插件 — 如需使用更多功能请开启 Rocket 前置插件 (加载插件 / RCON 指令 / 玩家管理)
+<div class="banner warn" id="rkban" style="display:none">🚀 Rocket 没装好 —— 网页发指令 / 刷新玩家列表 / 安全关服都会失败, 服务器也只是在裸跑
 <span style="flex:1"></span>
 <button class="btn sm" onclick="doRocketInstall()">立即开启</button>
 <button class="btn sm gray" onclick="ignoreRocket()">忽略</button></div>
@@ -4860,7 +5243,8 @@ def page_commands():
     close_stop = bool(_settings.get("close_bat_stops_server"))
     rocket_ok = rocket_installed()
     ver_card = dedi_version_card()
-    rocket_note = "· 检测到 Modules\\Rocket.Unturned" if rocket_ok else "· 不安装的话 Rocket 插件不会加载"
+    rocket_note = ("· " + rocket_check()["detail"]) if rocket_ok else \
+        ("· " + rocket_check()["detail"] + " —— 游戏不会报错, 只是静默不加载 Rocket")
     text, _ = read_file(commands_path())
     entries = parse_commands(text)
     known = {k for k, *_ in CMD_FIELDS} | {"pvp", "pve", "cheat", "cheats"}
@@ -4968,6 +5352,29 @@ def page_commands():
 (保存时留空 = 恢复游戏默认, 大厅不再显示图标)。</div>
 </div></div>"""
 
+    vac_on = anticheat_on("vac")
+    be_on = anticheat_on("be")
+    ac_card = f"""
+<div class="card" data-grp="ac"><h2>🛡️ 反作弊 (VAC / BattlEye 战眼)</h2>
+<div class="desc">这两项写在当前存档 <code class="k">Config.txt</code> 的 <code class="k">Server</code> 段,
+<b>默认都是开启的</b> —— 开着的时候作弊玩家进服会被拦。
+<b>没有特殊原因不要关闭</b>: 关掉的后果由服务器上所有人一起承担。</div>
+<div style="margin-top:12px;display:flex;flex-direction:column;gap:12px">
+<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+{check_html(vac_on, onchange='onchange="acToggle(this)"', ident="ac_vac", cls="ck-lg")}
+<span><b>VAC 反作弊</b> <code class="k">Server/VAC_Secure</code> — Steam 官方的反作弊, 建议一直开着</span></div>
+<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+{check_html(be_on, onchange='onchange="acToggle(this)"', ident="ac_be", cls="ck-lg")}
+<span><b>BattlEye (战眼) 反作弊</b> <code class="k">Server/BattlEye_Secure</code> — 游戏自带的服务端反作弊;
+朋友报「未开启 BattlEye 战眼」进不来时, 看「帮助」页置顶第 ③ 条</span></div></div>
+<div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+<button class="btn big" onclick="saveAc()">💾 保存反作弊设置</button>
+<span class="hint" style="margin:0">这块的保存按钮是独立的 · 改完要重启服务器才生效</span></div>
+<div class="hint">取消勾选 = 关掉这一层反作弊。关掉之后外挂进服<b>不会被拦</b>,
+别人辛辛苦苦盖的建筑和攒的进度<b>可能被乱改乱拆</b>; 只有在排查误封、
+或者朋友实在连不进来时才临时关一下, 处理完记得开回来。</div>
+</div>"""
+
     content = f"""
 <div class="card" data-grp="cmd"><h2>基础信息</h2>
 <div class="grid g2">
@@ -5023,8 +5430,16 @@ def page_commands():
 <div><label class="f"><b>服主 SteamID</b><code class="k">owner</code></label>
 <input class="f" data-key="owner" value="{esc(vals.get('owner',''))}"></div>
 </div>
+{ac_card}
 {other_html}
-<div class="card" data-grp="launch"><h2>启动参数</h2>
+<details class="advbox sosbox" id="launchbox" data-grp="launch">
+<summary>⚙️ 启动参数<em>不是开发人员不要动这一块 · 默认收起, 要点开才看得见</em></summary>
+<div class="advbody">
+<div style="border:1px solid var(--bad);border-radius:12px;padding:11px 14px;margin:6px 6px 13px;
+background:rgba(239,68,68,.10);color:var(--bad);font-size:13.5px;line-height:1.9">
+<b>启动参数不是开发人员请不要修改其他内容!</b> 这一栏里的选项会<b>原样拼进开服命令行</b>,
+改错了服务器可能<b>直接开不起来</b>、<b>朋友进不来</b>、或者<b>网页看不到运行日志</b>。
+看不懂是干什么用的框, 就保持现在这个样子别动 —— 日常开服联机用不到这里。</div>
 <div class="desc">启动命令固定为原版方式: <code class="k">-nographics -batchmode +Secureserver/存档名</code>。
 改完下面的选项点保存并重启服务器生效。</div>
 <div class="tip">萌新联机只需要用<b>服务器代码</b> (仪表盘正中间那串数字): 代码联机走 Steam P2P,
@@ -5045,13 +5460,15 @@ def page_commands():
 <input class="f" id="l_extra" value="{esc(lc['extra'])}" placeholder="用空格分隔, 不确定就不要填">
 <div class="hint">Unturned / Unity 支持的其他命令行参数写在这里, 例如 <code class="k">-LogConsole</code>。参数会原样追加到启动命令后。</div>
 <div style="margin-top:12px"><button class="btn" onclick="saveLaunch()">保存启动参数</button>
-<span class="hint" style="margin-left:10px">重启服务器后生效</span></div>
-</div>
+<span class="hint" style="margin-left:10px">重启服务器后生效 · 这一块的保存按钮和上面的「保存修改」是分开的</span></div>
+</div></details>
 {ver_card}
 <div class="card"><h2>Rocket 插件框架</h2>
-<div class="desc">Rocket 让服务器可以加载插件(.dll)。当前状态:
-<b style="color:{'var(--ok)' if rocket_ok else 'var(--bad)'}">{'已安装' if rocket_ok else '未安装'}</b>
+<div class="desc">Rocket 让服务器可以加载插件(.dll), 网页的控制台指令也靠它。当前状态:
+<b style="color:{'var(--ok)' if rocket_ok else 'var(--bad)'}">{'已装好' if rocket_ok else '没装好'}</b>
 {rocket_note}</div>
+<div class="hint" style="margin-top:6px">如果这里显示没装好, 网页的「发送命令 / 刷新玩家列表 / 安全关服」会全部失败,
+而游戏不会报错 —— 它只是静默地不加载 Rocket。</div>
 <div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">
 <button class="btn" onclick="installRocket()">{'重新安装 / 更新' if rocket_ok else '一键安装 Rocket'}</button>
 <button class="btn gray" onclick="openPlugins()">打开本存档的插件文件夹</button>
@@ -5153,6 +5570,23 @@ async function saveLaunch(){
 async function setCheat(el){el.disabled=true;
  var r=await post('/api/cheat',{on:el.checked});toast(r.msg,r.ok?0:1);
  if(!r.ok)el.checked=!el.checked;el.disabled=false;}
+/* ---- 反作弊: 取消勾选先弹一次确认; 这一块有自己独立的保存按钮 ---- */
+async function acToggle(el){
+ if(el.checked)return;
+ var nm=el.id=='ac_be'?'BattlEye (战眼) 反作弊':'VAC 反作弊';
+ var go=await modal({icon:'⚠️',title:'要关闭 '+nm+' 吗?',danger:true,
+  okText:'✔ 确定关闭',noText:'↩ 还是开着',
+  html:'<b>关闭反作弊可能不安全, 不建议这么做。</b><br><br>'+
+   '· 关掉以后用外挂的玩家进服<b>不会被拦</b>, 你和其他玩家盖的建筑、攒的进度都可能被乱改乱拆。<br>'+
+   '· 只有<b>排查误封</b>, 或者朋友报「未开启 BattlEye 战眼」连不进来时才临时关一下, 弄完记得开回来。<br>'+
+   '· 现在还没写进配置 —— 要点这块的「保存反作弊设置」, 再<b>重启服务器</b>才生效。<br><br>确定吗?'});
+ if(!go){el.checked=true;if(window.dirtyCheck)dirtyCheck();}}
+async function saveAc(){
+ var r=await post('/api/anticheat',{
+  vac:document.getElementById('ac_vac').checked,
+  be:document.getElementById('ac_be').checked});
+ toast(r.msg,r.ok?0:1);
+ if(r.ok&&window.dirtySaved)dirtySaved('[data-grp=ac]');}
 async function installRocket(){
  if(!(await modal({icon:'🚀',title:'安装 / 更新 Rocket',
   body:'将运行游戏自带 Extras 里的 Install Rocket.bat。安装完成后重启服务器生效。'})))return;
@@ -5200,11 +5634,17 @@ async function askMode(el){
  if(!s||!s.state)return;
  if(s.state==='running'){dlVis('dlbar','block');dlDraw(s);dlPoll();}
  else if(s.state==='error'||s.state==='cancelled')dlDraw(s);});})();
-/* 防呆登记: 这三块各有自己的保存按钮 */
+/* 防呆登记: 这四块各有自己的保存按钮 */
 var DIRTY_GROUPS=[
  {sel:'[data-grp=cmd]',name:'基础信息与游戏方式',save:save,fix:showMap},
+ {sel:'[data-grp=ac]',name:'反作弊设置',save:saveAc},
  {sel:'[data-grp=launch]',name:'启动参数',save:saveLaunch},
  {sel:'[data-grp=br]',name:'图标与大厅链接',save:saveBr}];
+/* 启动参数那一栏: 记住开合 (和「高级配置」一样, 默认收起) */
+(function(){var b=document.getElementById('launchbox');if(!b)return;
+ try{if(localStorage.getItem('ds_launchg')==='1')b.open=true;}catch(e){}
+ b.addEventListener('toggle',function(){
+  try{localStorage.setItem('ds_launchg',b.open?'1':'0');}catch(e){}});})();
 """
     return shell("cmds", "服务器设置", content, script, dirty=True)
 
@@ -5776,6 +6216,16 @@ function browse(){
 # ================================================================ 控制台
 def page_console():
     content = f"""
+<div class="card"><h2>控制台通道体检</h2>
+<div class="desc">网页上的<b>发送命令 / 刷新玩家列表 / 安全关服</b>都走 Rocket 的 RCON 通道。
+这一栏会直接告诉你卡在哪一环: Rocket 没装好、服务器进程已经崩了、还是配置被覆盖。
+<b>发指令失败时这里也会自动更新</b>, 不用自己猜。</div>
+<div id="rkline" class="hint" style="margin-top:10px">正在体检…</div>
+<div id="rkev" class="hint" style="opacity:.72;margin-top:6px;word-break:break-all"></div>
+<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+<button class="btn sm gray" onclick="rkDiag()">🔍 重新体检</button>
+<button class="btn sm" onclick="rkFix()">🚀 修复 Rocket</button>
+</div></div>
 <div class="card"><h2>在线玩家</h2>
 <div class="desc">点「刷新玩家列表」获取在线玩家 (会显示玩家名 + SteamID)。给物品/给车辆/传送/踢出属于作弊指令, 需要服务器开启作弊 (Commands.dat 里的 <code class="k">cheats on</code>)。<br>
 按钮会自动用 <b>SteamID</b> 定位玩家, 中文玩家名也不会匹配失败。<br>
@@ -5843,21 +6293,41 @@ async function poll(){
 function applyFilter(){var only=document.getElementById('f_err').checked;
  term.querySelectorAll('.l').forEach(l=>{l.style.display=(only&&l.dataset.err!=='1')?'none':'';});}
 var fe=document.getElementById('f_err');if(fe)fe.addEventListener('change',applyFilter);
+async function rkDiag(){
+ var box=document.getElementById('rkline'),ev=document.getElementById('rkev');
+ if(!box)return;
+ box.textContent='体检中…';
+ var r;
+ try{r=await (await fetch('/api/rcon/diag')).json();}
+ catch(e){box.textContent='体检没能跑起来: '+e;return;}
+ if(r.ok){box.innerHTML='<span style="color:#6ee7b7">✅ RCON 端口通了, 网页控制台可以正常发指令</span>'
+  +' · 游戏目录里 Rocket 文件 '+(r.rocket&&r.rocket.files||0)+' 个';}
+ else{box.innerHTML='<span style="color:#fca5a5">⚠ '+ (r.msg||'连不上服务器') + '</span>';}
+ if(ev)ev.textContent='证据: '+(r.evidence||'');
+}
+async function rkFix(){
+ var box=document.getElementById('rkline');
+ box.textContent='正在运行官方安装脚本 (Extras\\Install Rocket.bat)…';
+ var r=await post('/api/rocket/install',{});
+ toast(r.msg,r.ok?0:1);
+ if(r.ok)setTimeout(rkDiag,600);else rkDiag();
+}
 async function send(){var el=document.getElementById('cmd');var c=el.value.trim();if(!c)return;
- el.value='';var r=await post('/api/console',{cmd:c});if(!r.ok)toast(r.msg,1);}
-async function quick(c){var r=await post('/api/console',{cmd:c});if(!r.ok)toast(r.msg,1);
- else toast('已发送: '+c);}
+ el.value='';var r=await post('/api/console',{cmd:c});if(!r.ok){toast(r.msg,1);rkDiag();}}
+async function quick(c){var r=await post('/api/console',{cmd:c});
+ if(!r.ok){toast(r.msg,1);rkDiag();}else toast('已发送: '+c);}
 async function promptCmd(base,q1,q2,verb){
  var a=prompt(q1);if(!a)return a.trim()===''?null:a.trim();
  var cmd=base+' '+a.trim();
  if(q2){var b=prompt(q2);if(b===null)return;cmd+=' '+b.trim();}
  var r=await post('/api/console',{cmd:cmd});
- if(!r.ok)toast(r.msg,1);else toast('已发送: '+cmd);}
+ if(!r.ok){toast(r.msg,1);rkDiag();}else toast('已发送: '+cmd);}
 async function refreshPlayers(){
  var box=document.getElementById('plist');
  box.textContent='获取中…';
  var r=await post('/api/players');
- if(!r.ok){box.textContent=r.msg||'获取失败';document.getElementById('pcount').textContent='';return;}
+ if(!r.ok){box.textContent=r.msg||'获取失败';document.getElementById('pcount').textContent='';
+  rkDiag();return;}
  renderPlayers(r.players,r.raw);}
 function renderPlayers(players,raw){
  var box=document.getElementById('plist');
@@ -5887,7 +6357,7 @@ function renderPlayers(players,raw){
   box.appendChild(row);});
 }
 document.getElementById('cmd').addEventListener('keydown',e=>{if(e.key==='Enter')send();});
-poll();setInterval(poll,1500);
+poll();setInterval(poll,1500);rkDiag();
 """
     return shell("term", "控制台", content, script)
 
@@ -5897,7 +6367,9 @@ def page_help():
     content = """
 <div class="card sos"><h2><span class="sostag">置顶</span>🚨 进不去服务器? 对着报错一条条解决</h2>
 <div class="desc">你或朋友用服务器代码连接失败时, 游戏会在屏幕上弹一句提示。下面四条覆盖了日常遇到的
-绝大多数情况, <b>先看清提示是哪一条, 再照着做</b>, 不用一头雾水地乱重启。</div>
+绝大多数情况, <b>先看清提示是哪一条, 再照着做</b>, 不用一头雾水地乱重启。<br>
+<span class="hint">这一页从哪个页面都能一步跳到: 每个页面<b>最上面那排的红色按钮
+「🚨 进不去服帮助」</b>点一下就到这里 (v0.1.17 起)。</span></div>
 
 <div class="sosrow"><b>① 服务器连接超时 / 连接失败</b>
 <div class="fix">一般是<b>本机网络</b>的问题, 不是服务器坏了。让进不去的那个人<b>连着试两次</b>;
@@ -5910,8 +6382,9 @@ def page_help():
 
 <div class="sosrow"><b>③ 未开启 BattlEye (战眼反作弊)</b>
 <div class="fix">两条路选一条:<br>
-① 在开服器「玩法设置」页 → 网络/安全 → 把 <code class="k">BattlEye 反作弊</code> 设为<b>关闭</b>,
-保存后重启服务器;<br>
+① 在开服器<b>「服务器设置」页</b>中间的 <b>「🛡️ 反作弊 (VAC / BattlEye 战眼)」</b> 卡片里,
+把 <code class="k">BattlEye (战眼) 反作弊</code> 的勾<b>取消</b> → 点「保存反作弊设置」→ 重启服务器
+(关反作弊开服器会先弹框跟你确认一次);<br>
 ② 给<b>游戏本体</b>(不是服务器)重装战眼: Steam 库里右键 Unturned → 管理 → 浏览本地文件 →
 进 <code class="k">BattlEye</code> 文件夹运行 <code class="k">Install_BattlEye.bat</code>,
 装完重启电脑再进服。</div></div>
@@ -6030,7 +6503,7 @@ Steam 会自动把你的<b>游戏本体</b>更新到最新, 但<b>开服端不�
 
 <div class="card"><h2>🔧 玩法设置最底下那个「高级配置」(v0.1.14 起)</h2>
 <div class="desc" style="line-height:2.1">
-「玩法设置」页平时看到的 67 项是<b>挑出来最常调的</b>; 官方 Config.txt 里还剩一大把参数没地方填。
+「玩法设置」页平时看到的那几十项是<b>挑出来最常调的</b>; 官方 Config.txt 里还剩一大把参数没地方填。
 这一版把它们收进了页面最底下的 <b>「🔧 高级配置」</b> —— <b>默认是收起的, 不点开就当它不存在</b>,
 一行代码都不会往存档里写, 原来那一页多长还是多长。<br>
 · 一共 <b>191 项</b>, 分 13 个段落 (玩家 / 僵尸 / 动物 / 载具 / 建筑 / 物品 / 场景物件 / 事件天气 /
@@ -6052,7 +6525,7 @@ Steam 会自动把你的<b>游戏本体</b>更新到最新, 但<b>开服端不�
 <div class="desc" style="line-height:2.1">
 <b>仪表盘</b> — 开服 / 重启 / 关服, 查看服务器代码和基本信息<br>
 <b>一键设置</b> — 最常用的傻瓜开关: 死亡不掉落、建筑无敌、车辆无敌、僵尸不拆家、摔落伤害、组队友伤、空投、出生满技能、<b>无需指南针/GPS/手绘地图也能看方向和地图</b>; 僵尸强度 / 经验倍率 / 物资丰富度 / 天气; 还有 <b>Rocket 指令反馈汉化</b><br>
-<b>服务器设置</b> — 服务器名称、地图、人数、端口、PVP/PVE、<b>难度 (换难度会列出到底改了哪些数值)</b>、视角、进服密码、<b>开启作弊 (cheats on)</b>; 以及<b>启动参数</b>、<b>开服端版本检查与一键更新</b>、<b>Rocket 安装</b>, 页面最底下是 <b>服务器图标与大厅链接 (图床设置)</b><br>
+<b>服务器设置</b> — 服务器名称、地图、人数、端口、PVP/PVE、<b>难度 (换难度会列出到底改了哪些数值)</b>、视角、进服密码、<b>开启作弊 (cheats on)</b>、<b>反作弊开关 (VAC / BattlEye 战眼, v0.1.17 起)</b>; 以及默认收起的<b>红框「启动参数」</b>、<b>开服端版本检查与一键更新</b>、<b>Rocket 安装</b>, 页面最底下是 <b>服务器图标与大厅链接 (图床设置)</b><br>
 <b>玩法设置</b> — 进阶参数: 血量、经验、刷怪、刷车、建筑承伤、空投频率、天气等。每一项都标了<b>能填的范围、游戏默认值、0 和 1 分别是什么意思</b>, 超出范围的会被拦下来不让保存; 页面最底下还有一个默认收起的 <b>「🔧 高级配置」(191 项, 官方 Config.txt 里剩下的那些参数, 有关键词筛选)</b><br>
 <b>创意工坊</b> — 填模组 ID 自动下载 Steam 创意工坊模组 (已下载的工坊地图会自己出现在「服务器设置」的地图下拉框里)<br>
 <b>存档管理</b> — <b>建筑存档 / 玩家存档</b>的备份与删除 (删除前强制先备份, 位置自己选)<br>
@@ -6061,9 +6534,13 @@ Steam 会自动把你的<b>游戏本体</b>更新到最新, 但<b>开服端不�
 <b>文件管理</b> — 直接编辑所有配置文件 (含 Rocket 插件配置)
 </div></div>
 
-<div class="card"><h2>服务器启动参数 (服务器设置页底部)</h2>
+<div class="card"><h2>服务器启动参数 (服务器设置页那个红框, 点开才有)</h2>
 <div class="desc" style="line-height:2.1">
-启动命令固定为: <code class="k">-nographics -batchmode +Secureserver/存档名</code> (原版方式, VAC 反作弊开启)<br>
+从 <b>v0.1.17</b> 起这一栏改成<b>默认收起</b>的了 (和「玩法设置」页底下的「高级配置」一个样子),
+边框是<b>红色</b>的 —— 这不是为了好看: 这一栏里的每一项都会<b>原样拼进开服命令行</b>,
+<b>不是开发人员请不要修改其他内容</b>, 改错了服务器可能直接开不起来、朋友进不来。
+日常开服联机<b>一个都不用动</b>, 不点开就当它不存在。<br>
+启动命令固定为: <code class="k">-nographics -batchmode +Secureserver/存档名</code> (原版方式)<br>
 <b>联机只用服务器代码</b> (仪表盘复制): 走 Steam P2P, 不需要 Login_Token、不需要端口映射;<br>
 不填 Login_Token 只影响"互联网列表 / 公网 IP 直连", 不影响代码联机<br>
 <code class="k">-batchmode</code> — 无窗口后台运行 (推荐勾选)<br>
@@ -6072,7 +6549,23 @@ Steam 会自动把你的<b>游戏本体</b>更新到最新, 但<b>开服端不�
 　　　　<b>关闭开服器 / 关闭网页后, 服务器会一直在后台运行</b>, 想关服回来点「关服」或在服务器窗口按 Ctrl+C<br>
 　　　　关闭此选项则完全后台静默运行, 网页「运行日志」会更完整<br>
 <code class="k">关闭 bat 窗口时同时关闭服务器</code> — 默认关闭 (服务器驻留); 打开后关掉 bat 窗口会自动保存并关闭服务器<br>
-<code class="k">自定义参数</code> — 其他官方支持的启动参数写在这里, 用空格分隔; 不确定就不要填
+<code class="k">自定义参数</code> — 其他官方支持的启动参数写在这里, 用空格分隔; 不确定就不要填<br>
+<span class="hint">这一块有<b>自己的「保存启动参数」按钮</b>, 和上面的「保存修改」是分开的;
+红框那一栏<b>记住你开没点开</b>, 这次点开了, 下次回到这页还是开着的。</span>
+</div></div>
+
+<div class="card"><h2>🛡️ 反作弊开关: VAC 与 BattlEye 战眼 (v0.1.17 起)</h2>
+<div class="desc" style="line-height:2.1">
+「服务器设置」页中间新加了一张 <b>「反作弊 (VAC / BattlEye 战眼)」</b> 卡片, 两个勾<b>默认都是开启的</b>:<br>
+· <code class="k">VAC_Secure</code> — Steam 官方的反作弊; <code class="k">BattlEye_Secure</code> — 游戏自带的服务端战眼<br>
+· 两项写在当前存档 <code class="k">Config.txt</code> 的 <code class="k">Server</code> 段,
+这一块<b>有自己独立的「保存反作弊设置」按钮</b>, 改完要<b>重启服务器</b>才生效<br>
+· <b>取消勾选时开服器会先弹框问你一次</b> —— 关闭反作弊可能不安全, 不建议这么做:
+关掉之后外挂进服<b>不会被拦</b>, 别人盖的建筑、攒的进度都可能被乱改乱拆。点「还是开着」勾会自动退回去<br>
+· 什么时候真的要关: 排查误封, 或者朋友报<b>「未开启 BattlEye (战眼反作弊)」</b>连不进来
+(见本页置顶第 ③ 条), 处理完记得开回来<br>
+· 这两项<b>以前在「玩法设置」页的网络/安全那一段里</b>, v0.1.17 起已从那一页撤走 ——
+同一个键在两个页面各有一份表单值, 后保存的那次会把先改的覆盖回去, 所以只留一个地方能改
 </div></div>
 
 <div class="card"><h2>Rocket 插件 (服务器设置页)</h2>
@@ -6166,6 +6659,12 @@ Steam 会自动把你的<b>游戏本体</b>更新到最新, 但<b>开服端不�
 (旧版本只认手动输入框, 所以下拉框选了没反应)。保存后本页会显示真实地图名; 地图名探测不到时
 <b>开服会给黄字警告</b>, 不会再一声不响地退回 PEI。创意工坊地图要先在「创意工坊」页订阅才会下载。
 另外<b>换地图等于换一张全新的世界</b>, 老地图的建筑仍然存在 <code class="k">Level\\旧地图名</code> 里, 名字改回去就能看到<br>
+<b>存档名、地图名能不能用中文?</b> <b>能。</b>「Servers」里<b>已经存在</b>的存档, 文件夹叫中文照样选得中
+(v0.1.16 起, 别人给你的存档包不用再改名); 创意工坊地图和 <code class="k">Level</code> 里的地图名叫中文,
+下拉框认得、也换得动。<b>只有在这里新建存档时要求英文</b> —— 新名字会原样写进开服命令行
+<code class="k">+Secureserver/存档名</code>, 英文最稳。万一某个中文名字的存档出现
+「网页显示在运行、点关服却关不掉」, 把 <code class="k">Servers\\那个文件夹</code> 改成英文名就好,
+里面的建筑存档和玩家存档都不用动<br>
 <b>想调的参数「玩法设置」翻遍了也没有?</b> 拉到那一页<b>最底下</b>, 点开默认收起的
 「🔧 高级配置」—— 官方 Config.txt 里剩下的 191 项都在里面, 顶部有关键词筛选框;
 那一块<b>有自己独立的保存按钮</b>, 填完别只点上面那个「保存全部修改」<br>
@@ -6598,7 +7097,9 @@ def page_setup():
     inst_rows = "".join(
         f'<label class="r"><input type="radio" name="inst" value="{esc(i["name"])}"'
         f'{" checked" if i["name"] == _pre else ""}><span><b>{esc(i["name"])}</b>'
-        f'</span><span style="margin-left:auto" class="hint">上次运行 {esc(i["time"])}</span></label>'
+        + ('<span class="hint" style="margin-left:8px">· 名字含中文, 可以用</span>'
+           if not ascii_path(i["name"]) else "")
+        + f'</span><span style="margin-left:auto" class="hint">上次运行 {esc(i["time"])}</span></label>'
         for i in insts)
 
     # 第 1 步默认只推商店那条路; steamcmd 面板收起来, 点「备用」按钮或真有任务在跑时才摊开
@@ -6707,7 +7208,11 @@ if(t)localStorage.setItem('untheme',t);}}catch(e){{}}</script>
 
 <div class="step" id="step2" style="display:{'block' if step2_visible else 'none'}">
 <h2>第 2 步 · 选择或创建服务器存档</h2>
-<div class="desc">存档 = 一个独立的服务器实例 (有自己的地图、玩家数据、配置)。Servers 文件夹里每个子文件夹都是一个存档。</div>
+<div class="desc">存档 = 一个独立的服务器实例 (有自己的地图、玩家数据、配置)。Servers 文件夹里每个子文件夹都是一个存档。
+<b>别人给你的存档、或者游戏里建的存档, 文件夹名是中文也能直接选</b>; 只有在这里<b>新建</b>存档时
+才要求用英文 (新名字会写进开服命令行 <code class="k">+Secureserver/存档名</code>, 英文最稳)。
+万一某个名字带中文的存档出现「网页显示在运行却关不掉服」, 把 <code class="k">Servers\\那个文件夹</code>
+改名成英文就行, 里面的数据不用动。</div>
 <div id="instlist">{inst_rows or '<div class="hint">这个游戏目录下还没有任何存档</div>'}</div>
 <label class="r"><input type="radio" name="inst" value="__new__"{" checked" if _pre == "__new__" else ""}>
 <span><b>创建新存档</b></span></label>
@@ -6898,6 +7403,14 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(u.query)
             page = page_edit(qs.get("path", [""])[0])
             return self._html(page if page else "<h1>文件不存在</h1>", 200 if page else 404)
+        if u.path == "/api/rcon/diag":
+            why, ev = rcon_diag()
+            return self._json({"ok": bool(ev["listening"]),
+                               "listening": bool(ev["listening"]),
+                               "running": server_running()[0], "msg": why,
+                               "evidence": ev["evidence"],
+                               "rocket": rocket_status()})
+
         if u.path == "/api/console":
             _push_log_tails()
             after = int(parse_qs(u.query).get("after", ["0"])[0])
@@ -6981,21 +7494,25 @@ class Handler(BaseHTTPRequestHandler):
             running, _ = server_running()
             if running and name != instance():
                 return self._json({"ok": False, "msg": "服务器正在运行, 请先关服再切换存档"})
-            if not INSTANCE_NAME_RE.match(name):
-                return self._json({"ok": False, "msg": "存档名只能用英文字母、数字、- 和 _"})
-            created = False
             inst_dir = os.path.join(game_dir(), "Servers", name)
-            if not os.path.isdir(inst_dir):
-                # 目录不存在(包括与旧 settings.json 同名的情况) -> 直接创建补齐
+            if os.path.isdir(inst_dir):
+                if not existing_instance_ok(name):
+                    return self._json({"ok": False,
+                                       "msg": "这个存档文件夹名用不了 (名字里不能带路径符号)"})
+                ensure_instance_files(name)   # 补齐缺失的 Commands.dat / Config.txt
+                created = False
+            else:
+                # 目录不存在 (包括与旧 settings.json 同名的情况) -> 新建, 这一条仍要英文名
                 ok, msg = create_instance(name)
                 if not ok:
                     return self._json({"ok": False, "msg": msg})
                 created = True
-            else:
-                ensure_instance_files(name)   # 补齐缺失的 Commands.dat / Config.txt
             _settings["instance"] = name
             save_settings()
             oplog("操作", f"{'创建' if created else '切换'}存档: {name}")
+            hint = "" if created else non_ascii_name_hint(name)
+            if hint:
+                oplog("操作", f"选中非英文存档名: {name} | {hint}")
             return self._json({"ok": True, "created": created,
                                "rocket": rocket_status(),
                                "msg": f"已选择存档「{name}」"})
@@ -7048,22 +7565,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": ok, "msg": msg})
         if u.path == "/api/restart":
             ok, msg = stop_server()
+            if not ok and msg != "服务器没有在运行":
+                # 关服这一步没成 (例如 shutdown 发出去了但世界还在存), 就别急着开新局
+                oplog("操作", f"点击重启被关服结果拦下 → {msg}")
+                return self._json({"ok": False, "msg": msg})
             if ok:
                 time.sleep(2)
-                ok2, msg2 = start_server()
-                oplog("操作", f"点击重启 → {msg2}")
-                return self._json({"ok": ok2, "msg": "已关闭, " + msg2,
-                                   "wsmap": ws_start_notice(ok2)})
             ok2, msg2 = start_server()
             oplog("操作", f"点击重启 → {msg2}")
-            return self._json({"ok": ok2, "msg": msg2, "wsmap": ws_start_notice(ok2)})
+            return self._json({"ok": ok2, "msg": ("已关闭, " + msg2) if ok else msg2,
+                               "wsmap": ws_start_notice(ok2)})
 
         if u.path == "/api/console":
-            ok, msg = send_command(str(body.get("cmd", ""))[:500])
+            cmd = str(body.get("cmd", ""))[:500]
+            ok, msg = send_command(cmd)
             if ok:
-                oplog("操作", f"发送控制台命令: {str(body.get('cmd', ''))[:200]}")
-            else:
-                oplog("错误", f"命令发送失败: {msg}")
+                oplog("操作", f"发送控制台命令: {cmd}")
             return self._json({"ok": ok, "msg": msg if not ok else "已发送"})
 
         if u.path == "/api/players":
@@ -7074,8 +7591,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 resp = rcon_command("players")
             except (OSError, RconError) as e:
+                why, ev = rcon_diag()
+                oplog("错误", f"刷新玩家列表失败: {e} | {ev['evidence']}")
                 return self._json({"ok": False, "players": [], "raw": "",
-                                   "msg": f"获取失败: {e}"})
+                                   "msg": f"获取失败: {e} —— {why}"})
             players = parse_players(resp)
             _write_title_file(len(players))
             oplog("操作", f"刷新玩家列表: {len(players)} 人在线")
@@ -7091,6 +7610,18 @@ class Handler(BaseHTTPRequestHandler):
             save_settings()
             oplog("操作", f"保存启动参数: {lc}, 关bat关服={lc and _settings['close_bat_stops_server']}")
             return self._json({"ok": True, "msg": "启动参数已保存, 重启服务器后生效"})
+
+        if u.path == "/api/anticheat":
+            vac, be = bool(body.get("vac", True)), bool(body.get("be", True))
+            ok_v, msg_v = set_anticheat("vac", vac)
+            ok_b, msg_b = set_anticheat("be", be)
+            if not (ok_v and ok_b):
+                bad = " / ".join(m for ok, m in ((ok_v, msg_v), (ok_b, msg_b)) if not ok)
+                oplog("错误", f"保存反作弊设置失败: {bad}")
+                return self._json({"ok": False, "msg": "没保存成功: " + bad})
+            if not (vac and be):
+                return self._json({"ok": True, "msg": "⚠ " + (msg_v if not vac else msg_b)})
+            return self._json({"ok": True, "msg": "✔ 反作弊已全部开启 (VAC + BattlEye), 重启服务器后生效"})
 
         if u.path == "/api/rocket/install":
             oplog("操作", "点击安装/更新 Rocket")
