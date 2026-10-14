@@ -33,7 +33,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 OPLOG_PATH = os.path.join(BASE_DIR, "操作日志.txt")
 HOST, PORT = "127.0.0.1", 8787
-VERSION = "0.1.21"      # 发布版本号: 改这里 + 新增 更新内容-版本号.md + 跑 发布打包.py
+VERSION = "0.1.22"      # 发布版本号: 改这里 + 新增 更新内容-版本号.md + 跑 发布打包.py
 # 发行版本: full = 完整版 (自带 SteamCMD 下载开服端)。从 v0.1.12 起只发完整版 ——
 # 自带的工具才 1.6 MB, 再单独出一份"没有下载功能"的简装版没意义。
 # lite 分支的代码保留, 只为兼容手里还拿着旧简装包的人。
@@ -4666,11 +4666,19 @@ _kernel = [None, False]
 
 
 def _k32():
-    """kernel32 句柄 (只在 Windows 上有; 拿不到就整块显示不出来, 不报错)"""
+    """kernel32 句柄 (只在 Windows 上有; 拿不到就整块显示不出来, 不报错)。
+    进程句柄是 64 位的, 必须声明好参数类型 —— 不然 ctypes 按 32 位整型传,
+    高位被截掉, GetProcessTimes 只会拿到「无效句柄」"""
     if not _kernel[1]:
         _kernel[1] = True
         try:
-            _kernel[0] = ctypes.windll.kernel32
+            k = ctypes.windll.kernel32
+            k.OpenProcess.restype = ctypes.c_void_p
+            k.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            k.CloseHandle.argtypes = [ctypes.c_void_p]
+            k.GetProcessTimes.restype = ctypes.c_int
+            k.GetProcessTimes.argtypes = [ctypes.c_void_p] + [ctypes.c_void_p] * 4
+            _kernel[0] = k
         except (AttributeError, OSError):
             _kernel[0] = None
     return _kernel[0]
@@ -4724,14 +4732,50 @@ def sys_cpu_pct():
 
 _proc_last = [None]
 
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_srv_handle_cache = [None, 0]          # (我们开的进程句柄, 它对应哪个 pid)
+_srv_handle_lock = threading.Lock()
+
+
+def _close_srv_handle():
+    """放掉我们自己开的那份句柄 (锁内调用)"""
+    h, _srv_handle_cache[:] = _srv_handle_cache[0], [None, 0]
+    k = _k32()
+    if h and k:
+        try:
+            k.CloseHandle(h)
+        except OSError:
+            pass
+
 
 def _srv_handle():
-    """我们自己在网页上点起来的那个服务器进程句柄; 不是我们启动的就不查"""
+    """我们自己在网页上点起来的那个服务器进程的句柄; 不是我们启动的就不查。
+
+    句柄是我们按 pid 向 Windows 另外开的, 只用来读进程计数。
+    不能取 Popen 的属性 —— subprocess.Popen 在 Windows 上没有公开的 handle
+    (只有私有的 _handle), v0.1.19~0.1.21 就是拿 p.handle 让 /api/status 每 4 秒抛一次
+    AttributeError, 一点开服整个页面就开始弹错。"""
     with _proc_lock:
         p = _proc
-    if p is None or p.poll() is not None:
-        return None
-    return p.handle
+    pid = p.pid if (p is not None and p.poll() is None) else 0
+    with _srv_handle_lock:
+        if _srv_handle_cache[1] != pid:
+            _close_srv_handle()          # 进程换了或者已经退出, 旧句柄不能留
+        if not pid:
+            return None
+        if _srv_handle_cache[0]:
+            return _srv_handle_cache[0]
+        k = _k32()
+        if not k:
+            return None
+        try:
+            h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+        except OSError:
+            return None
+        if not h:
+            return None
+        _srv_handle_cache[:] = [h, pid]
+        return h
 
 
 def proc_usage(handle):
@@ -4750,6 +4794,9 @@ def proc_usage(handle):
         fn = getattr(k, "K32GetProcessMemoryInfo", None)
         if fn is None:
             fn = ctypes.windll.psapi.GetProcessMemoryInfo
+        if getattr(fn, "restype", None) is None:
+            fn.restype = ctypes.c_int
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
         if not fn(handle, ctypes.byref(pm), pm.cb):
             return None
         mem = int(pm.WorkingSetSize)
@@ -4769,18 +4816,24 @@ def proc_usage(handle):
 
 
 def machine_stats():
-    """给网页用的一揽子机器占用; 任何一项拿不到就留空, 界面上整块不显示"""
-    total, avail = phys_mem()
-    out = {"ok": bool(total), "cores": os.cpu_count() or 0,
-           "total": total, "avail": avail,
-           "used_pct": round((1 - avail / total) * 100) if total else 0,
-           "cpu": sys_cpu_pct(), "proc_cpu": None, "proc_mem": 0}
-    if total:
-        u = _srv_handle()
-        if u:
-            got = proc_usage(u)
+    """给网页用的一揽子机器占用; 任何一项拿不到就留空, 界面上整块不显示。
+    这几格只是「顺带看一眼」的信息, 采不到不能让状态轮询和仪表盘跟着报错,
+    所以整块兜底成空值 —— v0.1.19 那次一点开服就满屏弹错, 缺的就是这一层。"""
+    out = {"ok": False, "cores": os.cpu_count() or 0, "total": 0, "avail": 0,
+           "used_pct": 0, "cpu": None, "proc_cpu": None, "proc_mem": 0}
+    try:
+        total, avail = phys_mem()
+        out["ok"] = bool(total)
+        out["total"], out["avail"] = total, avail
+        out["used_pct"] = round((1 - avail / total) * 100) if total else 0
+        out["cpu"] = sys_cpu_pct()
+        if total:
+            h = _srv_handle()
+            got = proc_usage(h) if h else None
             if got:
                 out["proc_cpu"], out["proc_mem"] = got
+    except Exception:
+        pass
     return out
 
 
@@ -5902,10 +5955,18 @@ def page_dash():
     mem_row = ""
     if st["ok"]:
         ms = f'{esc(gb(st["total"]))} / {esc(gb(st["avail"]))} GB'
+        # proc_cpu 第一次采样拿不到 (要两次才差得出占用), 显示成 — 而不是把整页弄崩
+        if not st["proc_mem"]:
+            proc_row = "没在运行"
+        else:
+            pc = "—" if st["proc_cpu"] is None else f'{st["proc_cpu"]:.0f} %'
+            pmem = (human_size(st["proc_mem"]) if st["proc_mem"] < 1073741824
+                    else f'{gb(st["proc_mem"])} GB')
+            proc_row = f"{pc} / {pmem}"
         mem_row = f"""
 <div class="stat"><div class="k">内存 (总 / 还剩)</div><div class="v" id="mc-mem">{ms}</div></div>
 <div class="stat"><div class="k">本机 CPU 占用</div><div class="v" id="mc-cpu">{('—') if st['cpu'] is None else f'{st["cpu"]:.0f} %'}</div></div>
-<div class="stat"><div class="k">服务端进程 (CPU / 内存)</div><div class="v" id="mc-proc">{'没在运行' if not st["proc_mem"] else f'{st["proc_cpu"]:.0f} % / {human_size(st["proc_mem"]) if st["proc_mem"] < 1073741824 else gb(st["proc_mem"]) + " GB"}'}</div></div>"""
+<div class="stat"><div class="k">服务端进程 (CPU / 内存)</div><div class="v" id="mc-proc">{proc_row}</div></div>"""
     ban = ""
     if mem:
         sz = (f'这张地图在本存档里实际占 {human_size(mem["map_size"]["bytes"])}'
