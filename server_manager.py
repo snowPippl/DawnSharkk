@@ -8,6 +8,7 @@ Unturned 服务器开服器 (本地网页版 · 萌新友好版)
         创意工坊模组、建筑与玩家存档备份/删除(删前强制备份)、全部配置文件(含 Rocket 插件)读取与修改、明/暗主题切换
 - 纯 Python 标准库, 自带免安装 Python, 双击 DawnSharkk.exe 即用 (备用: 启动开服器.bat)
 """
+import ctypes
 import json
 import os
 import random
@@ -32,7 +33,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 OPLOG_PATH = os.path.join(BASE_DIR, "操作日志.txt")
 HOST, PORT = "127.0.0.1", 8787
-VERSION = "0.1.17"           # 发布版本号: 改这里 + 新增 更新内容-版本号.md + 跑 发布打包.py
+VERSION = "0.1.21"      # 发布版本号: 改这里 + 新增 更新内容-版本号.md + 跑 发布打包.py
 # 发行版本: full = 完整版 (自带 SteamCMD 下载开服端)。从 v0.1.12 起只发完整版 ——
 # 自带的工具才 1.6 MB, 再单独出一份"没有下载功能"的简装版没意义。
 # lite 分支的代码保留, 只为兼容手里还拿着旧简装包的人。
@@ -90,6 +91,18 @@ def server_dir():
     g, i = game_dir(), instance()
     if g and i:
         return os.path.join(g, "Servers", i)
+    return None
+
+
+def server_log_path():
+    """游戏自己写的服务器日志: <游戏目录>\\Logs\\Server_<存档>.log
+
+    服务器用自己的控制台窗口之后, 网页「运行日志」就没有中继文件了, 改读这一份 ——
+    实测里面照样有 Loading level: 100% 和 Server Code 两个门控要用的标记。
+    """
+    g, i = game_dir(), instance()
+    if g and i:
+        return os.path.join(g, "Logs", f"Server_{i}.log")
     return None
 
 
@@ -2749,11 +2762,14 @@ def read_oplog(max_bytes=131072):
 
 # ================================================================ 进程 + 控制台
 _proc = None
+_helper = None            # 控制台窗口助手 (只负责图标和标题), 服务器自己拥有控制台
+_stdout_takeover = [False]   # 完全后台静默那一档: 开服器直接读 stdout, 不再翻日志文件
 _proc_lock = threading.Lock()
 _console = deque(maxlen=3000)
 _console_idx = [0]
 _log_tails = {"rocket": {"off": 0, "partial": b""},
-              "console": {"off": 0, "partial": b""}}
+              "console": {"off": 0, "partial": b""},
+              "server": {"off": 0, "partial": b""}}
 _server_code = [None]
 ERR_RE = re.compile(r"(error|exception|fail|warn)", re.I)
 CODE_RE = re.compile(r"Server Code:\s*([0-9]{6,})", re.I)
@@ -2867,24 +2883,54 @@ def _skip_old_log_lines():
     sd = server_dir()
     if not sd:
         return
-    for key, rel in (("console", "console.log"),
-                     ("rocket", os.path.join("Rocket", "Logs", "Rocket.log"))):
+    for key, path in (("console", os.path.join(sd, "console.log")),
+                      ("rocket", os.path.join(sd, "Rocket", "Logs", "Rocket.log")),
+                      ("server", server_log_path() or "")):
         try:
-            size = os.path.getsize(os.path.join(sd, rel))
+            size = os.path.getsize(path)
         except OSError:
             continue
         _log_tails[key].update(off=size, partial=b"")
 
 
-def _push_log_tails():
-    """网页日志来源: 原版控制台模式下优先 console.log(中继器写入), 否则 Rocket 日志"""
+def _log_source():
+    """网页「运行日志」当前该读哪一份: server = 游戏自己写的 Server_<存档>.log"""
     sd = server_dir()
     if not sd:
-        return
-    clog = os.path.join(sd, "console.log")
-    if os.path.isfile(clog):
-        _tail_file(clog, _log_tails["console"], "out")
-    else:
+        return None
+    slog = server_log_path()
+    if slog and os.path.isfile(slog):
+        return "server"
+    if os.path.isfile(os.path.join(sd, "console.log")):
+        return "console"
+    if os.path.isfile(os.path.join(sd, "Rocket", "Logs", "Rocket.log")):
+        return "rocket"
+    return None
+
+
+def _log_source_label(kind):
+    """网页「运行日志」右上角那句来源说明 (路径在这里拼好, 不交给 JS 猜)"""
+    if kind == "server":
+        return "游戏自己写的 Logs\\Server_" + (instance() or "") + ".log"
+    if kind == "console":
+        return "旧版残留的 console.log"
+    if kind == "rocket":
+        return "Rocket 日志"
+    return "暂无日志文件 — 服务器完全启动后生成; 若一直为空请安装 Rocket 并重启服务器"
+
+
+def _push_log_tails():
+    """网页日志来源: 优先游戏自己写的 Server_<存档>.log, 其次旧包残留的 console.log,
+    都没有才退回 Rocket 日志"""
+    if _stdout_takeover[0]:
+        return        # 完全后台静默那一档由开服器直接读 stdout, 再翻文件就同一条出现两遍
+    kind = _log_source()
+    sd = server_dir()
+    if kind == "server":
+        _tail_file(server_log_path(), _log_tails["server"], "out")
+    elif kind == "console":
+        _tail_file(os.path.join(sd, "console.log"), _log_tails["console"], "out")
+    elif kind == "rocket":
         _tail_file(os.path.join(sd, "Rocket", "Logs", "Rocket.log"),
                    _log_tails["rocket"], "rocket")
     _release_code()
@@ -2934,7 +2980,7 @@ def map_warning():
 
 
 def start_server():
-    global _proc
+    global _proc, _helper
     running, _ = server_running()
     if running:
         return False, "服务器已经在运行了"
@@ -2958,20 +3004,27 @@ def start_server():
         cmd.extend(extra)
     _skip_old_log_lines()
     _reset_code_gate()   # 每次开服的代码都不同, 上一局的绝不能继承
+    _reset_rcon_state()  # 上一局的失败次数/在线人数缓存同样作废
     if lc.get("console", True):
-        # 原版方式: 通过控制台中继器启动 —— 弹出独立控制台窗口显示全部输出,
-        # 同时写入 console.log 供网页日志使用; 关闭开服器/网页不影响服务器
+        # 原版方式: 让服务器自己拥有控制台窗口 —— 实测只有这样才能在那个窗口里打字下指令:
+        # stdout 一旦接进管道 (旧版经 reader.py 中继), Unturned 就不再读键盘, 打进去的字全消失
+        _stdout_takeover[0] = False
         srvname = (cmd_info().get("name") or instance() or "").strip()
         tfile = os.path.join(server_dir(), "title.tmp")
         with _proc_lock:
-            _proc = subprocess.Popen(
-                [sys.executable, os.path.join(BASE_DIR, "reader.py"),
-                 os.path.join(server_dir(), "console.log"), tfile, srvname] + cmd,
-                cwd=game_dir(), creationflags=subprocess.CREATE_NEW_CONSOLE)
+            _proc = subprocess.Popen(cmd, cwd=game_dir(),
+                                     creationflags=subprocess.CREATE_NEW_CONSOLE)
+            _helper = subprocess.Popen(
+                [sys.executable, os.path.join(BASE_DIR, "console_helper.py"),
+                 str(_proc.pid), tfile, srvname],
+                cwd=BASE_DIR, creationflags=subprocess.CREATE_NO_WINDOW)
         threading.Thread(target=_title_updater, args=(tfile,), daemon=True).start()
-        _log("—— 服务器以原版控制台窗口启动 (独立驻留, 关闭本开服器不影响服务器)", "sys")
-        _log("—— 网页「运行日志」实时同步自控制台窗口输出", "sys")
+        _log("—— 服务器用自己的控制台窗口启动 (独立驻留, 关闭本开服器不影响服务器)", "sys")
+        _log("—— 那个黑色窗口里可以直接打字下指令: rflush y / rwho / shutdown 等", "sys")
+        _log("—— 网页「运行日志」读游戏自己写的 Logs\\Server_"
+             + (instance() or "") + ".log", "sys")
     else:
+        _stdout_takeover[0] = True
         with _proc_lock:
             _proc = subprocess.Popen(
                 cmd, cwd=game_dir(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -3096,11 +3149,6 @@ def adopt_rcon():
                                   "port": port, "password": pw}
 
 
-def _relay_proc():
-    with _proc_lock:
-        return _proc
-
-
 def _game_gone():
     """本存档的 Unturned 进程是否已经退出 (True=已经没了)
 
@@ -3125,8 +3173,13 @@ def _wait_gone(cap):
 
 
 def _reap_relay():
-    """关掉控制台中继窗口 (reader.py), 并清掉窗口标题用的临时文件"""
-    helper = _relay_proc()
+    """关掉控制台窗口助手 (改图标和标题用的小进程), 并清掉窗口标题的临时文件
+
+    助手自己会盯着服务器进程退出, 这里只是关服时顺手收一下, 不留残留。
+    """
+    global _helper
+    with _proc_lock:
+        helper, _helper = _helper, None
     if helper is not None and helper.poll() is None:
         try:
             helper.kill()
@@ -3139,6 +3192,7 @@ def _reap_relay():
 
 
 def _after_stop():
+    _stdout_takeover[0] = False
     _reap_relay()
     restore_rcon()
     _srv_check["t"] = 0
@@ -3177,45 +3231,94 @@ def stop_server():
     if pids:
         _log("—— 服务器已被强制关闭", "sys")
         return True, "已强制关闭 (未保存世界。下次请先在控制台执行 save 或直接点关服按钮)"
-    _log("—— 机器上没有本存档的 Unturned 进程, 已关闭控制台中继窗口", "sys")
+    _log("—— 机器上没有本存档的 Unturned 进程, 已收掉开服器的控制台窗口", "sys")
     return True, ("已关掉本开服器的控制台窗口, 但机器上并没有找到本存档的 Unturned 进程 —— "
                   "服务器通常是已经自己崩了 (常见原因: Rocket 没装好、目录混装了游戏本体文件)。"
                   "请到「运行日志」看最后几行, 按「控制台」页的提示修复 Rocket 后重新开服")
 
 
 # ================================================================ RCON (控制台命令发送)
-# Unturned 不接受管道 stdin 命令, 因此开服前临时启用 Rocket 的 RCON
+# 网页发指令只能走 RCON: 实测 (v0.1.18-beta) Unturned 既不读管道 stdin,
+# 也不读"stdout 被接进管道"那个控制台窗口的键盘 —— 两条程序化喂指令的路都是死的,
+# 因此开服前临时启用 Rocket 的 RCON
 # (密码=本次运行的登录密钥), 关服后自动把 Rocket.config.xml 还原。
 # Rocket RCON 为行协议: 连接后先发 `login <密码>`, 之后每行一条命令。
 _rcon_cfg = None
+# Rocket 的 RCON 一条连接只服务一个客户端, 而服务器端同时只肯开 10 条全局 /
+# 3 条本地 (Rocket.config.xml 里的 MaxGlobalConnections / MaxLocalConnections)。
+# 网页发指令、控制台窗口取人数、体检, 任何一方和另一方撞车都会出事, 所以全站串行。
+_rcon_lock = threading.Lock()
+# 最近一次真实 RCON 结果, 体检和熔断都看这个, 不再另外去裸探端口
+_rcon_state = {"ok": None, "at": 0.0, "why": "", "fails": 0, "full": False}
+RCON_FAIL_LIMIT = 3        # 连续失败这么多次就停止后台轮询
+PLAYERS_TTL = 20.0         # 在线人数缓存有效期 (秒): 刷新按钮和窗口标题共用一份
+# Rocket 连接位占满时写给客户端的原话 (Rocket.Core 里的字面量), 命中就能当场确诊
+RCON_FULL_MARK = "too many clients connected to rcon"
 
 
 class RconError(Exception):
     pass
 
 
-def _rcon_recv(sock, quiet, cap=20.0):
-    """读到「连续 quiet 秒没有新内容」或服务器主动断链为止, 总时长不超过 cap 秒"""
+class RconFullError(RconError):
+    """Rocket 那 10 条全局 RCON 连接位被占满了 —— 有自带的自救指令"""
+
+    def __init__(self):
+        super().__init__("Rocket 的 RCON 连接位已经被占满 (全局上限 10 条)。"
+                         "在服务器的黑色控制台窗口里输入 rflush y 清空全部 RCON 连接, "
+                         "不用重启服务器、世界也不会丢; 清完再点一次指令就行")
+
+
+def _rcon_ok():
+    _rcon_state.update(ok=True, at=time.time(), why="", fails=0, full=False)
+
+
+def _rcon_fail(err):
+    text = str(err)
+    _rcon_state.update(ok=False, at=time.time(), why=text[:220],
+                       fails=_rcon_state["fails"] + 1,
+                       full=isinstance(err, RconFullError)
+                       or RCON_FULL_MARK in text.lower())
+
+
+def rcon_is_full():
+    """最近一次失败是不是「Rocket 的 RCON 连接位被占满了」"""
+    return bool(_rcon_state["full"])
+
+
+def _rcon_recv(sock, quiet, cap=20.0, first=None):
+    """读到服务器自己关掉这条连接 (回执讲完了) 为止; 一直没关就退化成静默判定。
+
+    服务器主动断开 = 边界确定, 这也是快起来的来源: 老版本只能干等 1.5 秒静默,
+    每条指令凭空慢一整秒半。
+    first 是「到现在一个字都没回」能忍多久 —— 登录成功时服务器就是不回话的,
+    这时候等满上限等于把整条指令拖死, 所以给一个比 quiet 更短的独立阈值。
+    """
     buf, t0, last = b"", time.time(), time.time()
+    if first is None:
+        first = quiet
     try:
-        sock.settimeout(1.0)
+        sock.settimeout(0.25)
     except OSError:
         pass
-    while time.time() - last < quiet and time.time() - t0 < cap:
+    while time.time() - t0 < cap:
         try:
             d = sock.recv(4096)
         except socket.timeout:
+            idle = time.time() - last
+            if idle >= (quiet if buf else first):
+                break               # 有内容且安静下来 / 压根没内容且已经认了
             continue
         except OSError:
             break
         if not d:
-            break                       # 服务器把这个连接关掉了: 回执到此为止
+            break                   # 服务器把这个连接关掉了: 回执到此为止
         buf += d
         last = time.time()
     return buf.decode("utf-8", "replace")
 
 
-# 这些命令要先把世界存下来才回话, 等短了就会「命令执行了、回执没收到」
+# 这些命令要先把世界存下来才回话, 等太短会「命令执行了、回执没收到」
 SLOW_COMMANDS = ("shutdown", "save", "exit", "reload", "restart", "saveworld")
 
 
@@ -3226,38 +3329,62 @@ def rcon_command(cmd, slow=None):
         raise RconError("RCON 未启用")
     if slow is None:
         slow = (cmd.strip().split() or [""])[0].lower() in SLOW_COMMANDS
-    sock = socket.create_connection(("127.0.0.1", _rcon_cfg["port"]), timeout=3)
-    try:
-        sock.settimeout(3)
-        buf = b""
-        while b"\n" not in buf:                    # 读取欢迎行 RocketRcon vX
-            d = sock.recv(256)
-            if not d:
-                raise RconError("连接被服务器关闭")
-            buf += d
-        sock.sendall(b"login " + _rcon_cfg["password"].encode("utf-8") + b"\n")
-        resp = _rcon_recv(sock, 1.0, 6.0)
-        if "error" in resp.lower() or "denied" in resp.lower():
-            raise RconError(resp.strip() or "登录失败")
-        sock.sendall(cmd.encode("utf-8") + b"\n")
-        # 存盘类命令给足时间: 提前 close 会让 Rocket 写回执时报
-        # ObjectDisposedException (真机 Rocket.log 里两次 shutdown 都是这个)
-        return _rcon_recv(sock, 6.0 if slow else 1.5, 60.0 if slow else 8.0).strip()
-    finally:
+    with _rcon_lock:
+        sock = socket.create_connection(("127.0.0.1", _rcon_cfg["port"]), timeout=3)
         try:
-            sock.close()
-        except OSError:
-            pass
+            sock.settimeout(3)
+            buf = b""
+            while b"\n" not in buf:                    # 读取欢迎行 RocketRcon vX
+                d = sock.recv(256)
+                if not d:
+                    raise RconError("连接被服务器关闭")
+                buf += d
+            sock.sendall(b"login " + _rcon_cfg["password"].encode("utf-8") + b"\n")
+            resp = _rcon_recv(sock, 0.5, 6.0)
+            if RCON_FULL_MARK in resp.lower():
+                raise RconFullError()
+            if "error" in resp.lower() or "denied" in resp.lower():
+                raise RconError(resp.strip() or "登录失败")
+            sock.sendall(cmd.encode("utf-8") + b"\n")
+            # 说完就半关闭 (只关写方向): 服务器把回执写完会自己关掉这条连接, 连接计数
+            # 由它自己归还。老做法是等 1.5 秒静默后硬 close —— 等于趁服务器还在往这条
+            # 连接上写的时候把 socket 撕了, Rocket 在 handleConnection 里抛空引用、
+            # 计数还不归还, 真机跑两小时能把 10 个连接位全漏光 (网页指令从此全部失效)
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            out = _rcon_recv(sock, 0.6, 60.0 if slow else 8.0, 20.0 if slow else 0.6).strip()
+            if RCON_FULL_MARK in out.lower():
+                raise RconFullError()
+            _rcon_ok()
+            return out
+        except (OSError, RconError) as e:
+            _rcon_fail(e)
+            raise
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
-def _port_open(port, timeout=0.6):
-    """这个端口到底有没有人在监听 (TCP 连得上)"""
-    try:
-        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
-        s.close()
-        return True
-    except OSError:
-        return False
+_players_cache = {"at": 0.0, "raw": ""}
+
+
+def _reset_rcon_state():
+    """开新局时把上一局的失败次数和在线人数缓存全部作废 (旧服务器没关干净时别接续熔断)"""
+    _rcon_state.update(ok=None, at=0.0, why="", fails=0, full=False)
+    _players_cache.update(at=0.0, raw="")
+
+
+def players_now(force=False):
+    """在线玩家回执; 带 TTL 缓存, 让窗口标题轮询和网页刷新共用同一条连接的结果"""
+    if not force and time.time() - _players_cache["at"] < PLAYERS_TTL:
+        return _players_cache["raw"]
+    raw = rcon_command("players")
+    _players_cache.update(at=time.time(), raw=raw)
+    return raw
 
 
 def _file_age(path):
@@ -3285,34 +3412,80 @@ def rocket_cfg_enabled():
     return (a.group(1) or "false").lower() == "true" if a else None
 
 
-def rcon_diag(port=None):
+def rcon_diag(port=None, probe=True):
     """RCON 连不上时先体检, 把"为什么"说清楚, 而不是让人干等一分钟再试。
 
     真机反馈过的现场是: 网页显示 Rocket 已安装、日志确实在滚, 但每条指令都
     [WinError 10061] —— 那是 TCP 层就没人监听, 跟"还在启动"没关系。
     返回 (一句结论, 证据 dict), 证据 dict 也会进操作日志, 截一张图就能定位。
+
+    体检是**真发一条 players**, 不是裸探端口: 连上就断会在服务器那边留一条
+    「没执行任何指令」的空会话, 而 Rocket 本地地址只肯同时开 3 条, 那些空会话
+    反过来会把正常指令挤掉。连不上时 TCP 异常本身就已经说明了端口有没有人听。
+
+    probe=False 时**一个字节都不发**, 只回答"服务器开没开": 页面刚打开就走这一档,
+    免得每次切到控制台都往游戏日志里塞一条 Client ID 记录。
     """
     port = port or (_rcon_cfg or {}).get("port") or 27115
     sd = server_dir()
     rk = rocket_check()
-    listening = _port_open(port)
+    up, pid = server_running()
+    if not up:
+        # 没开服的时候别说"服务器崩了" —— 用户根本没点过开启, 那句红字只会把人吓一跳
+        return ("服务器现在没有在运行, 所以 RCON 通道还没开始工作 —— 这一栏暂时给不出结论。"
+                "先在「仪表盘」点「🚀 开启服务器」, 开服之后再点「🔍 重新体检」",
+                {"port": port, "listening": None, "running": False, "level": "idle",
+                 "rocket_ok": rk["installed"], "rocket_detail": rk["detail"],
+                 "unturned": 0,
+                 "evidence": f"服务器没有在运行 (没有我们启动的进程, 也没在 tasklist 里认到) | "
+                             f"Rocket: {rk['detail']} | 没有做 RCON 探测"})
+    if not probe:
+        return ("服务器在运行 (pid %s), 通道还没体检 —— 点下面那颗「🔍 重新体检」才真发一条 "
+                "players 去问服务器, 平时不自动发是免得游戏日志里多刷一条 Client ID 记录" % pid,
+                {"port": port, "listening": None, "running": True, "level": "wait",
+                 "rocket_ok": rk["installed"], "rocket_detail": rk["detail"],
+                 "unturned": None,
+                 "evidence": f"服务器在运行 (pid {pid}) | Rocket: {rk['detail']} | 没有做 RCON 探测"})
+    if not _rcon_cfg:
+        adopt_rcon()
+    listening, why = None, ""
+    if _rcon_cfg:
+        try:
+            players_now(force=True)
+            listening = True
+        except RconError as e:
+            listening, why = True, str(e)        # 连上了但被服务器驳回: 端口是通的
+        except OSError as e:
+            listening, why = False, str(e)
     age_rocket = _file_age(os.path.join(sd, "Rocket", "Logs", "Rocket.log")) if sd else None
-    age_console = _file_age(os.path.join(sd, "console.log")) if sd else None
+    # 服务器输出现在落在游戏自己写的 Server_<存档>.log 里, 旧包的 console.log 只做兜底
+    slog = server_log_path()
+    age_console = _file_age(slog) if slog and os.path.isfile(slog) else (
+        _file_age(os.path.join(sd, "console.log")) if sd else None)
     procs = unturned_procs()
     ev = {"port": port, "listening": listening, "rocket_ok": rk["installed"],
           "rocket_detail": rk["detail"], "rocket_cfg": rocket_cfg_enabled(),
           "rocket_log_age": None if age_rocket is None else int(age_rocket),
           "console_age": None if age_console is None else int(age_console),
-          "unturned": len(procs)}
+          "unturned": len(procs), "rcon_why": why[:160]}
     def age_txt(v):
         return "没有这个文件" if v is None else f"{v} 秒前"
-    line = (f"端口 {port} {'有人监听' if listening else '没人监听'} | "
-            f"Rocket: {rk['detail']} | 配置 Enabled="
+    line = (f"端口 {port} " + ("有人监听" if listening else "没人监听"
+                               if listening is False else "没测 (RCON 未启用)")
+            + (f" | 服务器原话: {why[:120]}" if why else "")
+            + f" | Rocket: {rk['detail']} | 配置 Enabled="
             + ("开" if ev["rocket_cfg"] else "关" if ev["rocket_cfg"] is False else "读不到")
             + " | Rocket 日志 " + age_txt(ev["rocket_log_age"])
-            + " | 控制台日志 " + age_txt(ev["console_age"])
+            + " | 服务器日志 " + age_txt(ev["console_age"])
             + f" | 机器上 Unturned.exe {len(procs)} 个")
     ev["evidence"] = line
+    # 走到这里说明 server_running() 已经认到进程了 —— 下面每一条结论都是"服务器在跑但通道不通"
+    ev["running"] = True
+    ev["level"] = "full" if (listening and rcon_is_full()) else "ok" if listening else "warn"
+    if listening and rcon_is_full():
+        return ("Rocket 的 RCON 连接位 (全局上限 10 条) 被占满了, 所以每条指令都被拒收。"
+                "在服务器那个黑色控制台窗口里输入 rflush y 清空全部 RCON 连接 —— "
+                "这是 Rocket 自带的指令, 不用重启服务器、世界也不会丢, 清完指令就能用了", ev)
     if listening:
         return ("端口是通的, 那是密码或版本对不上 —— 把下面这行证据发过来", ev)
     if not rk["installed"]:
@@ -3321,9 +3494,9 @@ def rcon_diag(port=None):
                 "去「服务器设置」页最底下点「一键安装 Rocket」(或手动双击游戏目录 Extras 里的"
                 " Install Rocket.bat), 装完重启服务器", ev)
     if not procs:
-        return ("机器上已经没有 Unturned.exe 进程了 —— 服务器其实早就退出或崩了, "
-                "网页显示运行中是因为那个黑色控制台窗口(中继器)还开着。"
-                "请到黑色窗口看最后几行报错", ev)
+        return ("网页这边还记着服务器在运行, 可机器上已经数不到 Unturned.exe 进程了 —— "
+                "它其实刚刚退出或者崩了。请到那个黑色控制台窗口看最后几行报错 (窗口已经关掉的话, "
+                "读 " + os.path.join("Logs", f"Server_{instance() or '存档名'}.log") + ")", ev)
     if age_rocket is None or (age_console is not None and age_rocket > age_console + 5):
         return ("Rocket 文件是齐的, 但这次开服它一行日志都没写 —— 游戏没加载它。"
                 "最常见的原因就是这份开服端里混了游戏本体的文件 "
@@ -3422,7 +3595,8 @@ def send_command(cmd):
     except (OSError, RconError) as e:
         why, ev = rcon_diag()
         oplog("错误", f"命令发送失败: {e} | {ev['evidence']}")
-        return False, f"发送失败: {e} —— {why}"
+        # 连接位占满那条已经自带自救办法了, 别再叠一句体检结论刷屏
+        return False, (str(e) if rcon_is_full() else f"发送失败: {e} —— {why}")
     _log(f">>> {cmd.strip()}", "cmd")
     for ln in resp.splitlines():
         if ln.strip():
@@ -3903,7 +4077,42 @@ def save_inventory():
     return out
 
 
-def backup_saves(items, dest):
+def _backup_dir_name(inst, tag, stamp, maps=None):
+    """备份文件夹名: 带上存档名 + 地图名, 一眼就知道这份是哪张地图的"""
+    m = ("_" + "+".join(maps[:3])) if maps else ""
+    if maps and len(maps) > 3:
+        m += f"等{len(maps)}张地图"
+    return f"{inst}_{tag}{m}_{stamp}"
+
+
+def _free_dir(dest, name):
+    """备份时间只精确到秒, 同一秒里点两次不能撞进同一个文件夹互相覆盖"""
+    p = os.path.join(dest, name)
+    n = 2
+    while os.path.exists(p):
+        p = os.path.join(dest, f"{name}_{n}")
+        n += 1
+    return p
+
+
+def _write_backup_manifest(target, units, whole, note):
+    """写 备份清单.json —— 导入时靠它认地图、认是不是整体备份 (没有清单就现场扫目录)"""
+    maps = sorted({u["map"] for u in units if u.get("map")})
+    data = {"工具": "Dawn Sharkk 开服器", "版本": VERSION,
+            "存档": instance() or "", "生成时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "整体备份": bool(whole), "说明": note, "地图": maps,
+            "单元": [{"类型": u["kind"], "路径": u["rel"], "地图": u["map"],
+                     "文件数": u["files"], "字节": u["size"]} for u in units],
+            "合计字节": sum(u["size"] for u in units)}
+    try:
+        with open(os.path.join(target, MANIFEST_NAME), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass                       # 清单只是给导入用的辅助, 写失败不影响备份本身
+    return maps
+
+
+def backup_saves(items, dest, whole=False, note=""):
     """把选中的存档文件按原目录结构复制到用户指定位置; 返回 (ok, msg, 备份目录)"""
     inst = instance() or "save"
     files = []
@@ -3918,7 +4127,9 @@ def backup_saves(items, dest):
     if not dest:
         return False, "请先选择备份保存的位置", None
     stamp = time.strftime("%Y-%m-%d_%H%M%S")
-    target = os.path.normpath(os.path.join(dest, f"{inst}_备份_{stamp}"))
+    maps = sorted({r.split("/")[1] for r, _ in files if len(r.split("/")) > 1})
+    target = os.path.normpath(_free_dir(
+        dest, _backup_dir_name(inst, "备份" if not whole else "整体备份", stamp, maps)))
     try:
         os.makedirs(dest, exist_ok=True)
         test = os.path.join(dest, ".ds_storagetest")
@@ -3928,6 +4139,7 @@ def backup_saves(items, dest):
     except OSError as e:
         return False, f"目标位置无法写入: {e} — 请换一个文件夹", None
     done, skipped, total_bytes = 0, [], 0
+    ok_rows = []
     for rel, full in files:
         dst = os.path.join(target, *rel.split("/"))
         try:
@@ -3938,14 +4150,39 @@ def backup_saves(items, dest):
                 continue
             done += 1
             total_bytes += os.path.getsize(full)
+            ok_rows.append((rel, os.path.getsize(full)))
         except OSError as e:
             skipped.append(f"{rel} ({e})")
     if not done:
         return False, "备份失败, 一个文件都没有复制成功 — 已中止, 不会删除任何东西", None
+    _write_backup_manifest(target, _units_of_rels(ok_rows), whole,
+                           note or ("按文件勾选的备份" if not whole else "整体备份"))
     msg = (f"已备份 {done} 个文件 ({human_size(total_bytes)}) → {target}"
            + (f"; 失败 {len(skipped)} 个: {', '.join(skipped[:3])}" if skipped else ""))
     oplog("操作", f"备份存档 {done} 个文件 → {target}")
     return True, msg, target
+
+
+def _unit_key(rel):
+    """一个存档文件属于哪个目录单元: 建筑 = Level/<地图名>, 玩家 = Players/<SteamID>/<地图名>
+    —— 地图名永远是单元里那层文件夹, 备份和导入都按它认地图"""
+    p = rel.replace("\\", "/").strip("/").split("/")
+    if p[0].lower() == "level":
+        return "level", "Level/" + p[1] if len(p) > 1 else "Level", p[1] if len(p) > 1 else ""
+    if p[0].lower() == "players" and len(p) > 2:
+        return "player", "/".join(p[:3]), p[2]
+    return "level", "/".join(p[:2]), p[1] if len(p) > 1 else ""
+
+
+def _units_of_rels(rows):
+    """[(相对路径, 字节)] → 按地图文件夹归并出来的单元清单"""
+    out = {}
+    for rel, size in rows:
+        kind, key, mp = _unit_key(rel)
+        d = out.setdefault(key, {"kind": kind, "rel": key, "map": mp, "files": 0, "size": 0})
+        d["files"] += 1
+        d["size"] += size
+    return sorted(out.values(), key=lambda u: u["rel"])
 
 
 def delete_saves(items, dest):
@@ -3976,6 +4213,389 @@ def delete_saves(items, dest):
     if failed:
         m += f"; {len(failed)} 个删除失败: {', '.join(failed[:3])}"
     return True, m, target
+
+
+MANIFEST_NAME = "备份清单.json"
+LEVEL_CORE = set(LEVEL_FILE_ZH)          # 建筑存档的核心文件名
+PLAYER_CORE = set(PLAYER_FILE_ZH)        # 玩家存档的核心文件名
+LEVEL_MIN = 3                            # 至少三个建筑文件才算「整体备份」
+PLAYER_MIN = 5                           # 玩家档至少五个文件
+PLAYER_MUST = {"player", "inventory", "life", "skills"}
+
+
+def save_unit_full(rel, must_exist=True):
+    """单元相对路径 → 绝对路径。只允许 Level/<地图> 和 Players/<SteamID>/<地图> 这两种目录"""
+    sd = server_dir()
+    if not sd:
+        return None
+    parts = [p for p in str(rel).replace("\\", "/").strip("/").split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return None
+    if len(parts) < 2 or parts[0].lower() not in ("level", "players"):
+        return None
+    if len(parts) != (2 if parts[0].lower() == "level" else 3):
+        return None
+    if any(p in ("Level", "Players") for p in parts[1:]):
+        return None
+    base = os.path.abspath(sd)
+    full = os.path.abspath(os.path.join(base, *parts))
+    if not full.startswith(base + os.sep):
+        return None
+    if not os.path.isdir(full) and must_exist:
+        return None
+    return full
+
+
+def _dir_stats(d):
+    """目录里的文件数与字节 (含子目录, 所有扩展名都算)"""
+    rows, total = [], 0
+    for cur, _dirs, names in os.walk(d):
+        for nm in names:
+            p = os.path.join(cur, nm)
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                continue
+            rows.append(p)
+            total += sz
+    return rows, total
+
+
+def _stems(d):
+    out = set()
+    for p in _dir_stats(d)[0]:
+        s = os.path.splitext(os.path.basename(p))[0].lower()
+        if s.endswith("~"):
+            s = s[:-1]
+        out.add(s)
+    return out
+
+
+def _zh_set(kind, names):
+    src = LEVEL_FILE_ZH if kind == "level" else PLAYER_FILE_ZH
+    return "、".join(src.get(n, n) for n in sorted(names)) or "—"
+
+
+def _mk_unit(kind, rel, mp, pid, src):
+    files, size = _dir_stats(src)
+    stems = {os.path.splitext(os.path.basename(p))[0].lower() for p in files}
+    stems = {s[:-1] if s.endswith("~") else s for s in stems}
+    if kind == "level":
+        have = stems & LEVEL_CORE
+        miss = LEVEL_CORE - have
+        whole = len(have) >= LEVEL_MIN
+    else:
+        have = stems & PLAYER_CORE
+        miss = PLAYER_MUST - stems
+        whole = len(have) >= PLAYER_MIN and not miss
+    return {"kind": kind, "rel": rel, "map": mp, "id": pid, "src": src,
+            "files": len(files), "size": size, "whole": whole,
+            "have": sorted(have), "missing": sorted(miss)}
+
+
+def save_unit_dirs():
+    """本存档里可以整体备份 / 导入的目录单元 (建筑=Level/<地图名>, 玩家=Players/<SteamID>/<地图名>)"""
+    sd = server_dir()
+    out = []
+    if not sd:
+        return out
+    lv = os.path.join(sd, "Level")
+    try:
+        for m in sorted(os.listdir(lv), key=str.lower):
+            d = os.path.join(lv, m)
+            if os.path.isdir(d):
+                out.append(_mk_unit("level", f"Level/{m}", m, "", d))
+    except OSError:
+        pass
+    pl = os.path.join(sd, "Players")
+    try:
+        for pid in sorted(os.listdir(pl), key=str.lower):
+            pd = os.path.join(pl, pid)
+            if not os.path.isdir(pd):
+                continue
+            try:
+                subs = sorted(os.listdir(pd), key=str.lower)
+            except OSError:
+                continue
+            for m in subs:
+                d = os.path.join(pd, m)
+                if os.path.isdir(d):
+                    out.append(_mk_unit("player", f"Players/{pid}/{m}", m, pid, d))
+    except OSError:
+        pass
+    return out
+
+
+def backup_unit_dirs(rels, dest, note="", tag="整体备份"):
+    """按目录单元整份复制 —— 连地图名那一层文件夹一起带走, 导入时才认得出这是哪张地图的存档"""
+    sd = server_dir()
+    if not sd:
+        return False, "还没绑定游戏目录 / 存档", None
+    dest = str(dest or "").strip().strip('"')
+    if not dest:
+        return False, "请先选择备份保存的位置", None
+    units = []
+    for rel in rels:
+        full = save_unit_full(rel)
+        if not full:
+            return False, f"路径不被允许 (只能备份 Level/<地图名> 或 Players/<SteamID>/<地图名>): {rel}", None
+        mp = rel.replace("\\", "/").strip("/").split("/")
+        units.append(_mk_unit("level" if mp[0].lower() == "level" else "player",
+                              rel.replace("\\", "/"), mp[2] if mp[0].lower() == "players" else mp[1],
+                              mp[1] if mp[0].lower() == "players" else "", full))
+    if not units:
+        return False, "没有选择要备份的存档文件夹", None
+    stamp = time.strftime("%Y-%m-%d_%H%M%S")
+    maps = sorted({u["map"] for u in units if u["map"]})
+    try:
+        os.makedirs(dest, exist_ok=True)
+        test = os.path.join(dest, ".ds_storagetest")
+        with open(test, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(test)
+    except OSError as e:
+        return False, f"目标位置无法写入: {e} — 请换一个文件夹", None
+    target = os.path.normpath(_free_dir(
+        dest, _backup_dir_name(instance() or "save", tag, stamp, maps)))
+    done, skipped, total = 0, [], 0
+    ok_units = []
+    for u in units:
+        dst = os.path.join(target, *u["rel"].split("/"))
+        try:
+            shutil.copytree(u["src"], dst)
+        except (OSError, shutil.Error) as e:
+            skipped.append(f"{u['rel']} ({exc_summary(e)})")
+            continue
+        got, size = _dir_stats(dst)
+        if len(got) != u["files"]:
+            skipped.append(f"{u['rel']} (只复制出 {len(got)}/{u['files']} 个文件)")
+            continue
+        done += 1
+        total += size
+        u["size"] = size
+        ok_units.append(u)
+    if not done:
+        try:
+            shutil.rmtree(target, ignore_errors=True)
+        except OSError:
+            pass
+        return False, "备份失败, 一个存档文件夹都没能复制成功 — 已中止" + \
+               (f": {'; '.join(skipped[:2])}" if skipped else ""), None
+    _write_backup_manifest(target, ok_units, True, note or tag)
+    oplog("操作", f"整体备份 {done} 个存档文件夹 → {target}")
+    msg = (f"已整体备份 {done} 个存档文件夹 ({human_size(total)}, 地图 {'/'.join(maps) or '—'}) → {target}"
+           + (f"; 失败 {len(skipped)} 个: {'; '.join(skipped[:2])}" if skipped else ""))
+    return True, msg, target
+
+
+def _units_in_dir(root):
+    """在一个文件夹里找出存档单元。只认这几种摆法:
+       ① 备份根目录 (里面就是 Level / Players) ② 直接选到 Level/<地图名>
+       ③ 直接选到 Players/<SteamID>/<地图名>"""
+    out = []
+    lv = os.path.join(root, "Level")
+    if os.path.isdir(lv):
+        try:
+            for m in sorted(os.listdir(lv), key=str.lower):
+                d = os.path.join(lv, m)
+                if os.path.isdir(d):
+                    out.append(_mk_unit("level", f"Level/{m}", m, "", d))
+        except OSError:
+            pass
+    pl = os.path.join(root, "Players")
+    if os.path.isdir(pl):
+        try:
+            for pid in sorted(os.listdir(pl), key=str.lower):
+                pd = os.path.join(pl, pid)
+                if not os.path.isdir(pd):
+                    continue
+                try:
+                    subs = sorted(os.listdir(pd), key=str.lower)
+                except OSError:
+                    continue
+                for m in subs:
+                    d = os.path.join(pd, m)
+                    if os.path.isdir(d):
+                        out.append(_mk_unit("player", f"Players/{pid}/{m}", m, pid, d))
+        except OSError:
+            pass
+    if out:
+        return out
+    base = os.path.basename(root.rstrip("/\\"))
+    parent = os.path.basename(os.path.dirname(root.rstrip("/\\")))
+    grand = os.path.basename(os.path.dirname(os.path.dirname(root.rstrip("/\\"))))
+    if parent.lower() == "level":
+        return [_mk_unit("level", f"Level/{base}", base, "", root)]
+    if parent.lower() == "players" and grand:
+        return [_mk_unit("player", f"Players/{grand}/{base}", base, grand, root)]
+    return []
+
+
+def inspect_backup(path):
+    """导入前先看一眼这个文件夹: 是不是存档、是哪张地图、是不是整体备份"""
+    p = str(path or "").strip().strip('"')
+    cur = (cmd_info().get("map") or "").strip()
+    if not p:
+        return {"ok": False, "msg": "请先选择要导入的备份文件夹", "units": [], "importable": []}
+    if not os.path.exists(p):
+        return {"ok": False, "msg": f"找不到这个位置: {p}", "units": [], "importable": []}
+    if os.path.isfile(p):
+        nm = os.path.basename(p)
+        return {"ok": False, "single_file": True, "units": [], "importable": [],
+                "msg": (f"你选的是一个文件 ({nm}) —— 导入只接受整个文件夹。"
+                        f"像 Barricades.dat / Structures.dat 这种单个文件不能单独换: "
+                        f"它们记的是同一张地图上互相咬合的几份数据, 只换一个进去, "
+                        f"建筑会错位、报错, 严重的整张地图存档会废掉。"
+                        f"确实要手工替换, 请自己打开 {(os.path.join(server_dir() or '', 'Level', cur))} "
+                        f"把文件放进去 (先自己拷一份原件出来), 这样出问题只能手工还原。")}
+    units = _units_in_dir(p)
+    if not units:
+        return {"ok": False, "units": [], "importable": [],
+                "msg": ("这个文件夹里没有认出存档内容 —— 请在备份出来的那一层选 "
+                        "(里面应该能看到 Level 或 Players 文件夹), 不要选到再上面的目录。")}
+    importable, skipped = [], []
+    for u in units:
+        u["match"] = bool(cur) and u["map"].lower() == cur.lower()
+        src = LEVEL_FILE_ZH if u["kind"] == "level" else PLAYER_FILE_ZH
+        if not u["whole"]:
+            got = _zh_set(u["kind"], u["have"])
+            miss = _zh_set(u["kind"], u["missing"])
+            u["why"] = (f"{u['rel']} 只有 {len(u['have'])} 个{'建筑' if u['kind'] == 'level' else '玩家'}"
+                        f"核心文件 ({got}), 缺 {miss} —— 这是挑出来的散文件, 不是整体备份, 不能导入。"
+                        f"整体备份请回到「存档管理」页点「📦 整体备份」。")
+            skipped.append(u)
+        elif not u["match"]:
+            u["why"] = (f"这份是地图「{u['map']}」的存档, 当前服务器开的是「{cur or '未设置'}」—— "
+                        f"不是同一张地图, 导进去建筑会落到错的地图上。"
+                        f"要么先在「服务器设置」把地图改成 {u['map']}, 要么换对应地图的备份。")
+            skipped.append(u)
+        else:
+            importable.append(u)
+    mps = sorted({u["map"] for u in units})
+    if not importable:
+        return {"ok": False, "units": units, "importable": [], "cur_map": cur, "maps": mps,
+                "msg": "这个文件夹里没有能导入的内容: " + skipped[0]["why"]}
+    note = ""
+    if skipped:
+        note = f"; 另外 {len(skipped)} 个不符合条件已跳过: {skipped[0]['why']}"
+    kinds = {"level": "建筑", "player": "玩家"}
+    return {"ok": True, "units": units, "importable": importable, "cur_map": cur, "maps": mps,
+            "msg": (f"能导入 {len(importable)} 个存档单元 (地图 {mps[0]}, "
+                    f"{sum(u['files'] for u in importable)} 个文件, "
+                    f"{human_size(sum(u['size'] for u in importable))}): "
+                    + "、".join(f"{kinds[u['kind']]} {u['rel']}" for u in importable[:3])
+                    + ("…" if len(importable) > 3 else "") + note)}
+
+
+def import_backup(src, dest, rels=None, confirm=False):
+    """把备份文件夹里的存档整体导进当前存档: 先自动备份现有存档, 再换档, 失败自动退回"""
+    if not confirm:
+        return False, "请先看一遍检查结果再点确认", None
+    running, _ = server_running()
+    if running:
+        return False, "服务器正在运行 — 请先关服再导入, 否则游戏一保存就把导入的内容覆盖回去了", None
+    sd = server_dir()
+    if not sd:
+        return False, "还没绑定游戏目录 / 存档", None
+    res = inspect_backup(src)
+    if not res["ok"]:
+        return False, res["msg"], None
+    todo = [u for u in res["importable"] if not rels or u["rel"] in set(rels)]
+    if not todo:
+        return False, "选中的内容里没有符合导入条件的存档 (地图对不上或不是整体备份)", None
+    # ① 当前会被覆盖的存档, 先原样备份到备份目录 (玩家档尤其重要, 导错了还能退回)
+    cover = [u["rel"] for u in todo if save_unit_full(u["rel"])]
+    pre = None
+    if cover:
+        ok, msg, pre = backup_unit_dirs(cover, dest, note="导入前自动备份", tag="导入前自动备份")
+        if not ok:
+            return False, f"当前存档没能备份成功, 导入已取消 (一个文件都没动): {msg}", None
+    # ② 逐单元换档: 旧的先改名挪走 → 新的复制进来; 中间出错就把旧的改回来
+    staged, fail = [], None
+    for u in todo:
+        dst = os.path.join(sd, *u["rel"].split("/"))
+        old = None
+        if os.path.isdir(dst):
+            old = dst + ".导入前旧档"
+            try:
+                if os.path.isdir(old):
+                    shutil.rmtree(old)
+                os.rename(dst, old)
+            except OSError as e:
+                fail = f"{u['rel']}: 没能把当前存档挪开 ({exc_summary(e)})"
+                break
+        try:
+            shutil.copytree(u["src"], dst)
+            got, size = _dir_stats(dst)
+            if len(got) != u["files"]:
+                fail = f"{u['rel']}: 只复制进 {len(got)}/{u['files']} 个文件"
+        except (OSError, shutil.Error) as e:
+            fail = f"{u['rel']}: 复制失败 ({exc_summary(e)})"
+        staged.append((u["rel"], dst, old))
+        if fail:
+            break
+    if fail:
+        for rel, d, old in reversed(staged):
+            try:
+                if os.path.isdir(d):
+                    shutil.rmtree(d)
+                if old:
+                    os.rename(old, d)
+            except OSError:
+                pass
+        back = f" 已退回导入前的状态; 导入前的自动备份在 {pre}" if pre else " 已退回导入前的状态"
+        return False, f"导入没有完成 ({fail})。" + back, None
+    for rel, d, old in staged:
+        if old:
+            shutil.rmtree(old, ignore_errors=True)     # 内容已在 ① 的自动备份里
+    n = sum(u["files"] for u in todo)
+    b = sum(u["size"] for u in todo)
+    oplog("操作", f"导入存档 {len(staged)} 个单元 / {n} 个文件 ← {src}"
+          + (f" (导入前已备份到 {pre})" if pre else ""))
+    msg = (f"已导入 {len(staged)} 个存档单元 ({n} 个文件, {human_size(b)})。"
+           + (f"导入前的存档已整体备份到 {pre} —— 想退回导入前, 在这页选中那个文件夹再点一次导入即可。"
+              if pre else "本机原本没有对应的存档文件夹, 所以没有需要备份的旧数据。"))
+    return True, msg, pre
+
+
+def list_backups(dest, limit=30):
+    """列出备份目录里都有些什么: 地图 / 是不是整体 / 和当前服务器对不对得上 (供一键恢复)"""
+    d = str(dest or "").strip().strip('"') or os.path.join(BASE_DIR, "存档备份")
+    cur = (cmd_info().get("map") or "").strip()
+    if not os.path.isdir(d):
+        return {"ok": True, "dest": d, "cur_map": cur, "items": []}
+    try:
+        names = sorted((n for n in os.listdir(d) if os.path.isdir(os.path.join(d, n))),
+                       key=lambda n: os.path.getmtime(os.path.join(d, n)), reverse=True)
+    except OSError as e:
+        return {"ok": False, "msg": f"打不开备份目录: {exc_summary(e)}", "dest": d, "items": []}
+    out = []
+    for name in names[:limit]:
+        p = os.path.join(d, name)
+        maps, whole, from_tool = [], None, False
+        try:
+            with open(os.path.join(p, MANIFEST_NAME), encoding="utf-8") as f:
+                mf = json.load(f)
+            maps = mf.get("地图") or []
+            whole = bool(mf.get("整体备份"))
+            from_tool = True
+            files = sum(int(u.get("文件数", 0)) for u in mf.get("单元", []))
+            size = int(mf.get("合计字节", 0))
+        except (OSError, ValueError, TypeError):
+            us = _units_in_dir(p)
+            maps = sorted({u["map"] for u in us if u["map"]})
+            files = sum(u["files"] for u in us)
+            size = sum(u["size"] for u in us)
+            whole = all(u["whole"] for u in us) if us else False
+        try:
+            mt = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p)))
+        except OSError:
+            mt = ""
+        out.append({"name": name, "path": p, "mtime": mt, "maps": maps,
+                    "whole": whole, "from_tool": from_tool, "files": files, "size": size,
+                    "size_cn": human_size(size),
+                    "match": bool(cur) and cur.lower() in {m.lower() for m in maps}})
+    return {"ok": True, "dest": d, "cur_map": cur, "items": out}
 
 
 def list_dirs(path):
@@ -4017,8 +4637,211 @@ def human_size(n):
     return f"{n} B"
 
 
+# ================================================================ 机器负载 (内存 / CPU)
+# 只查 Windows 自己的系统计数: 和任务管理器同一级的数据。
+# 刻意不做的事: 不读游戏进程的内存内容、不注入、不枚举它加载了哪些模块 ——
+# 那几类动作才可能被 VAC / BattlEye 当成可疑行为, 查占用不会。
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+class _FileTime(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", ctypes.c_ulong), ("dwHighDateTime", ctypes.c_ulong)]
+
+
+class _ProcessMemoryCounters(ctypes.Structure):
+    _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t), ("PrivateWorkingSetSize", ctypes.c_size_t)]
+
+
+_kernel = [None, False]
+
+
+def _k32():
+    """kernel32 句柄 (只在 Windows 上有; 拿不到就整块显示不出来, 不报错)"""
+    if not _kernel[1]:
+        _kernel[1] = True
+        try:
+            _kernel[0] = ctypes.windll.kernel32
+        except (AttributeError, OSError):
+            _kernel[0] = None
+    return _kernel[0]
+
+
+def _ft100(t):
+    """FILETIME → 100 纳秒整数"""
+    return (t.dwHighDateTime << 32) | t.dwLowDateTime
+
+
+def phys_mem():
+    """(总物理内存字节, 当前可用字节); 拿不到就是 (0, 0)"""
+    k = _k32()
+    if not k:
+        return 0, 0
+    st = _MemoryStatusEx()
+    st.dwLength = ctypes.sizeof(st)
+    try:
+        if not k.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return 0, 0
+    except OSError:
+        return 0, 0
+    return int(st.ullTotalPhys), int(st.ullAvailPhys)
+
+
+_cpu_last = [None]
+
+
+def sys_cpu_pct():
+    """整台机器的 CPU 占用 (按所有核心归一化)。第一次只能取样, 返回 None"""
+    k = _k32()
+    if not k:
+        return None
+    idle, kern, user = _FileTime(), _FileTime(), _FileTime()
+    try:
+        if not k.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+            return None
+    except OSError:
+        return None
+    now = (_ft100(idle), _ft100(kern), _ft100(user))
+    prev = _cpu_last[0]
+    _cpu_last[0] = now
+    if prev is None:
+        return None
+    busy = (now[1] - prev[1]) + (now[2] - prev[2])      # kernel 里已含 idle
+    idle_d = now[0] - prev[0]
+    if busy <= 0:
+        return None
+    return max(0.0, min(100.0, (busy - idle_d) * 100.0 / busy))
+
+
+_proc_last = [None]
+
+
+def _srv_handle():
+    """我们自己在网页上点起来的那个服务器进程句柄; 不是我们启动的就不查"""
+    with _proc_lock:
+        p = _proc
+    if p is None or p.poll() is not None:
+        return None
+    return p.handle
+
+
+def proc_usage(handle):
+    """服务端进程的 (CPU 占用百分比, 工作集内存字节) —— 只读进程计数字, 不碰进程内容"""
+    k = _k32()
+    if not (k and handle):
+        return None
+    c = e = kern = user = None
+    try:
+        c, e, kern, user = _FileTime(), _FileTime(), _FileTime(), _FileTime()
+        if not k.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e),
+                                 ctypes.byref(kern), ctypes.byref(user)):
+            return None
+        pm = _ProcessMemoryCounters()
+        pm.cb = ctypes.sizeof(pm)
+        fn = getattr(k, "K32GetProcessMemoryInfo", None)
+        if fn is None:
+            fn = ctypes.windll.psapi.GetProcessMemoryInfo
+        if not fn(handle, ctypes.byref(pm), pm.cb):
+            return None
+        mem = int(pm.WorkingSetSize)
+    except (OSError, AttributeError):
+        return None
+    spent = _ft100(kern) + _ft100(user)
+    now = time.monotonic()
+    prev = _proc_last[0]
+    _proc_last[0] = (spent, now)
+    cpu = None
+    if prev is not None and now > prev[1]:
+        cores = max(1, os.cpu_count() or 1)
+        wall = (now - prev[1]) * 10000000.0 * cores
+        if wall > 0:
+            cpu = max(0.0, min(100.0, (spent - prev[0]) * 100.0 / wall))
+    return cpu, mem
+
+
+def machine_stats():
+    """给网页用的一揽子机器占用; 任何一项拿不到就留空, 界面上整块不显示"""
+    total, avail = phys_mem()
+    out = {"ok": bool(total), "cores": os.cpu_count() or 0,
+           "total": total, "avail": avail,
+           "used_pct": round((1 - avail / total) * 100) if total else 0,
+           "cpu": sys_cpu_pct(), "proc_cpu": None, "proc_mem": 0}
+    if total:
+        u = _srv_handle()
+        if u:
+            got = proc_usage(u)
+            if got:
+                out["proc_cpu"], out["proc_mem"] = got
+    return out
+
+
+def gb(n):
+    return f"{n / 1073741824:.1f}"
+
+
+LOW_MEM_GB = 8.5            # 8G 标称的机器实际总量在 7.9~8.0 之间, 留一点余量
+
+
+def low_mem_notice():
+    """内存偏紧的提醒: 只在「总内存 ≤8G 且本局用的是创意工坊地图」时给,
+    免得对跑得住小机器的用户无差别说教。返回 None 表示不用提醒。"""
+    st = machine_stats()
+    if not st["ok"] or st["total"] / 1073741824 > LOW_MEM_GB:
+        return None
+    e = workshop_map_of(cmd_info().get("map"))
+    if not e:
+        return None
+    size = workshop_map_size(e["id"])
+    return {"total_gb": gb(st["total"]), "avail_gb": gb(st["avail"]),
+            "used_pct": st["used_pct"], "map": e["map"], "id": e["id"],
+            "map_size": size, "mods": len(ws_subscribed_ids())}
+
+
+_map_size_cache = {}
+
+
+def workshop_map_size(pid, ttl=600):
+    """这张创意工坊地图在本存档里实际占多少字节 (含它的资产包)。数目录要跑一遍文件表,
+    所以按 10 分钟缓存; 文件特别多时只数前 2 万个并标「约」"""
+    sd = server_dir()
+    if not sd:
+        return None
+    full = os.path.join(sd, "Workshop", "Steam", "content", WS_APPID, str(pid))
+    if not os.path.isdir(full):
+        return None
+    now = time.time()
+    hit = _map_size_cache.get(pid)
+    if hit and now - hit[1] < ttl:
+        return hit[0]
+    total, n, capped = 0, 0, False
+    for cur, _dirs, names in os.walk(full):
+        for nm in names:
+            try:
+                total += os.path.getsize(os.path.join(cur, nm))
+            except OSError:
+                continue
+            n += 1
+            if n >= 20000:
+                capped = True
+                break
+        if capped:
+            break
+    out = {"bytes": total, "files": n, "capped": capped}
+    _map_size_cache[pid] = (out, now)
+    return out
+
+
 def _write_title_file(n):
-    """把在线人数写给控制台中继器 (窗口标题用)"""
+    """把在线人数写给控制台窗口助手 (服务器窗口标题用)"""
     try:
         sd = server_dir()
         if sd:
@@ -4029,9 +4852,13 @@ def _write_title_file(n):
 
 
 def _title_updater(tfile):
-    """每 30 秒经 RCON 查询一次在线人数, 供服务器控制台窗口标题显示; 服务器退出后清理"""
+    """每 60 秒取一次在线人数写给控制台窗口助手 (服务器窗口标题用); 服务器退出后清理
+
+    连续 RCON 失败到上限就不再敲了: 以前是每 30 秒无条件打一次, 服务器那边
+    已经拒收还照打, 真机两小时打了 300 次, 日志被刷满也没人看得出问题。
+    """
     while True:
-        time.sleep(30)
+        time.sleep(60)
         with _proc_lock:
             alive = _proc is not None and _proc.poll() is None
         if not alive and server_running()[0] is False:
@@ -4040,8 +4867,14 @@ def _title_updater(tfile):
             except OSError:
                 pass
             return
+        if _rcon_state["fails"] >= RCON_FAIL_LIMIT:
+            _log("—— 连续 " + str(_rcon_state["fails"]) +
+                 " 次连不上服务器控制台, 窗口标题的在线人数已停止刷新; "
+                 "若指令也全部失效, 在黑色控制台窗口输入 rflush y 清空 RCON 连接即可恢复",
+                 "sys")
+            return
         try:
-            n = len(parse_players(rcon_command("players")))
+            n = len(parse_players(players_now()))
             _write_title_file(n)
         except Exception:
             pass
@@ -5064,7 +5897,33 @@ def page_dash():
 <div class="ds" style="font-size:12px">{t['desc']}</div></div></div>"""
     cheat_check = check_html(cheat_on, onchange='onchange="setCheat(this)"',
                              ident="d_cheat", cls="ck-lg")
+    st = machine_stats()
+    mem = low_mem_notice()
+    mem_row = ""
+    if st["ok"]:
+        ms = f'{esc(gb(st["total"]))} / {esc(gb(st["avail"]))} GB'
+        mem_row = f"""
+<div class="stat"><div class="k">内存 (总 / 还剩)</div><div class="v" id="mc-mem">{ms}</div></div>
+<div class="stat"><div class="k">本机 CPU 占用</div><div class="v" id="mc-cpu">{('—') if st['cpu'] is None else f'{st["cpu"]:.0f} %'}</div></div>
+<div class="stat"><div class="k">服务端进程 (CPU / 内存)</div><div class="v" id="mc-proc">{'没在运行' if not st["proc_mem"] else f'{st["proc_cpu"]:.0f} % / {human_size(st["proc_mem"]) if st["proc_mem"] < 1073741824 else gb(st["proc_mem"]) + " GB"}'}</div></div>"""
+    ban = ""
+    if mem:
+        sz = (f'这张地图在本存档里实际占 {human_size(mem["map_size"]["bytes"])}'
+              if mem["map_size"] else "这张地图的占用还没法算 (存档里没找到它的文件夹)")
+        ban = f"""
+<div class="banner warn block" id="memban"><b class="t">🧠 这台机器内存偏紧 ({mem['total_gb']} GB, 现在还剩 {mem['avail_gb']} GB)</b>
+<p>本局开的是创意工坊地图 <b class="hl">{esc(mem['map'])}</b> —— {sz},
+另外这个存档订阅了 <b class="hl">{mem['mods']}</b> 个创意工坊内容。
+这种组合在 8 GB 及以下的机器上很容易吃满内存: 表现为<b class="hl">进图很慢、地图卡顿、服务端越来越占</b>,
+朋友那边则像是「连上了但一动一卡的」。</p>
+<p>能立刻减轻负担的三件事: ① <b class="hl">少装几个模组</b> (模组数量比地图本身更吃内存);
+② 把游戏和存档放在 <b class="hl">SSD</b> 上, 进图和加载会明显快一些 (帧率仍受游戏本身限制);
+③ 开服前关掉浏览器、直播、录屏这些同样吃内存的程序。</p>
+<p class="hint">这只是提醒, 不是限制 —— 8 GB 机器开小地图照样跑得动; 上面这几项数据在「内存 (总 / 还剩)」那格随时能看。</p>
+<span style="flex:1"></span>
+<button class="btn sm gray" onclick="hideMem()">知道了</button></div>"""
     content = f"""
+{ban}
 <div class="banner warn" id="rkban" style="display:none">🚀 Rocket 没装好 —— 网页发指令 / 刷新玩家列表 / 安全关服都会失败, 服务器也只是在裸跑
 <span style="flex:1"></span>
 <button class="btn sm" onclick="doRocketInstall()">立即开启</button>
@@ -5088,6 +5947,10 @@ def page_dash():
   <div class="stat"><div class="k">作弊选项 (cheats on)</div><div class="v" id="st-cheat">{'✅ 已开启' if cheat_on else '⭕ 未开启'}</div></div>
   <div class="stat"><div class="k">Rocket 前置</div><div class="v" id="st-rk">检测中…</div></div>
 </div>
+{f'''<div class="card" style="margin-top:14px"><h2>这台机器的负担</h2>
+<div class="desc">数据来自 Windows 自己的系统计数 (和任务管理器同源), 每 4 秒跟着刷新一次;
+服务端那一格只在服务器运行时有数。查的是<b>内存还剩多少、CPU 占了多久</b>, 不去读游戏的存档内容。</div>
+<div class="grid g3">{mem_row}</div></div>''' if st["ok"] else ""}
 <div class="card" style="margin-top:14px"><h2>默认开服选项</h2>
 <div class="desc">下面每一项都会<b>立即应用到当前服务器</b> (重启生效), 并自动保存为<b>以后新建服务器的默认设置</b>。</div>
 <div class="trow" style="border-bottom:1px solid rgba(255,255,255,.06)">
@@ -5140,6 +6003,18 @@ async function dashTog(id,el){el.disabled=true;
 function ignoreRocket(){sessionStorage.setItem('rkIgnored','1');
  var b=document.getElementById('rkban');if(b)b.style.display='none';
  toast('已忽略 — 随时点右上角 🚀 徽章开启 Rocket');}
+function gbOf(n){return (n/1073741824).toFixed(1);}
+function paintMachine(m){if(!m||!m.ok)return;var el;
+ el=document.getElementById('mc-mem');if(el)el.textContent=gbOf(m.total)+' / '+gbOf(m.avail)+' GB';
+ el=document.getElementById('mc-cpu');if(el)el.textContent=(m.cpu==null)?'—':(m.cpu.toFixed(0)+' %');
+ el=document.getElementById('mc-proc');
+ if(el){if(!m.proc_mem)el.textContent='没在运行';
+  else el.textContent=(m.proc_cpu==null?'—':m.proc_cpu.toFixed(0)+' %')+' / '
+   +(m.proc_mem>=1073741824?gbOf(m.proc_mem)+' GB':(m.proc_mem/1048576).toFixed(0)+' MB');}}
+function hideMem(){var b=document.getElementById('memban');if(b)b.style.display='none';
+ sessionStorage.setItem('memBanOff','1');}
+if(sessionStorage.getItem('memBanOff')){var mb=document.getElementById('memban');if(mb)mb.style.display='none';}
+setInterval(function(){paintMachine(lastStatus&&lastStatus.machine);},2000);
 """
     return shell("dash", "仪表盘", content, script)
 
@@ -5280,7 +6155,7 @@ def page_commands():
                     "table": difficulty_rows_html(pinned=pinned, only=(a, b))}
     persp_pills = pills("perspective", [("first", "仅第一人称"), ("third", "仅第三人称"),
                                         ("both", "都可以 (推荐)"), ("vehicle", "载具内第三人称")])
-    pvpve = pills("pvpve", [("pvp", "⚔️ PVP 玩家对战"), ("pve", "🧟 PVE 只打僵尸")])
+    pvpve = pills("pvpve", [("pvp", "⚔️ PVP 玩家对战"), ("pve", "🧟 PVE 只打僵尸")], cur=cur_pvpve)
 
     cur_map = (vals.get("map") or "").strip()
     detected = list_maps()
@@ -5429,6 +6304,11 @@ def page_commands():
 <div class="hint">留空 = 任何人都能进。公网开服建议设置密码。</div></div>
 <div><label class="f"><b>服主 SteamID</b><code class="k">owner</code></label>
 <input class="f" data-key="owner" value="{esc(vals.get('owner',''))}"></div>
+<div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+<button class="btn big" onclick="save()">💾 保存修改</button>
+<span class="hint" style="margin:0">这一颗是<b>本页唯一的保存按钮</b> (v0.1.21 起底下那颗重复的去掉了) ·
+它一次把「基础信息 + 游戏方式 + 其他配置项」写进同一份 <code class="k">Commands.dat</code> ·
+改完<b>重启服务器</b>才生效</span></div>
 </div>
 {ac_card}
 {other_html}
@@ -5446,7 +6326,7 @@ background:rgba(239,68,68,.10);color:var(--bad);font-size:13.5px;line-height:1.9
 <b>不需要</b> <code class="k">Login_Token</code>、不需要端口映射。不填 Login_Token 只影响"互联网服务器列表
 / 公网 IP 直连"这两种方式, 代码联机不受任何影响。</div>
 <div style="margin-top:12px;display:flex;gap:16px 24px;flex-wrap:wrap;align-items:center">
-{check_html(lc['console'], ident="l_console", cls="ck-lg")}<span><b>原版控制台窗口</b> (推荐) — 服务器有自己独立的黑色控制台窗口, 关闭开服器/网页后<b>服务器继续运行</b></span>
+{check_html(lc['console'], ident="l_console", cls="ck-lg")}<span><b>原版控制台窗口</b> (推荐) — 服务器有自己独立的黑色控制台窗口: 关闭开服器/网页后<b>服务器继续运行</b>, 而且<b>可以在窗口里直接打字下指令</b> (rflush y / shutdown 等, v0.1.18-beta 起)</span>
 </div>
 <div style="margin-top:10px;display:flex;gap:16px 24px;flex-wrap:wrap;align-items:center">
 {check_html(lc['batchmode'], ident="l_batch", cls="ck-lg")}<span><b>-batchmode</b> 无窗口后台运行 (推荐, 默认勾选)</span>
@@ -5460,7 +6340,7 @@ background:rgba(239,68,68,.10);color:var(--bad);font-size:13.5px;line-height:1.9
 <input class="f" id="l_extra" value="{esc(lc['extra'])}" placeholder="用空格分隔, 不确定就不要填">
 <div class="hint">Unturned / Unity 支持的其他命令行参数写在这里, 例如 <code class="k">-LogConsole</code>。参数会原样追加到启动命令后。</div>
 <div style="margin-top:12px"><button class="btn" onclick="saveLaunch()">保存启动参数</button>
-<span class="hint" style="margin-left:10px">重启服务器后生效 · 这一块的保存按钮和上面的「保存修改」是分开的</span></div>
+<span class="hint" style="margin-left:10px">重启服务器后生效 · 这一块的保存按钮和上面「游戏方式」卡片里那颗「💾 保存修改」是分开的</span></div>
 </div></details>
 {ver_card}
 <div class="card"><h2>Rocket 插件框架</h2>
@@ -5478,9 +6358,10 @@ background:rgba(239,68,68,.10);color:var(--bad);font-size:13.5px;line-height:1.9
 插件配置文件会自动出现在「文件管理」里。</div>
 </div>
 <div class="card">
-<button class="btn big" onclick="save()">💾 保存修改</button>
 <a class="btn big gray" href="/edit?path=Server/Commands.dat">原始编辑器</a>
-<span class="hint" style="margin-left:12px">保存后需要重启服务器才会生效 —— 改过没保存就切页或开服, 会弹框提醒并帮你直接保存</span></div>
+<span class="hint" style="margin-left:12px">这一页的保存按钮只有<b>「游戏方式」卡片里那一颗</b> (v0.1.21 起下面那颗
+重复的「保存修改」去掉了) —— 它点一次会把<b>基础信息、游戏方式、其他配置项一起写进</b>同一份
+<code class="k">Commands.dat</code>。保存后需要重启服务器才会生效 —— 改过没保存就切页或开服, 会弹框提醒并帮你直接保存</span></div>
 {browser_card}
 """
     script = DL_CORE_JS + "\nvar MODE_CUR=" + json.dumps(mode_cur) + ";" + \
@@ -5622,11 +6503,11 @@ async function askMode(el){
  if(!d){MODE_CUR=to;return;}
  var note='以上是游戏原版的默认值, 换难度不会重建世界, 也不会动你已有的存档建筑。'+
           '带橙色标记的项你已经在「玩法设置」里单独填过, 那一项仍然以你填的为准。'+
-          '选完记得点「保存修改」并重启服务器。';
+          '选完记得点「游戏方式」卡片里那颗「💾 保存修改」, 然后重启服务器。';
  var go=await modal({icon:'⚖️',title:(d.from+' → '+d.to)+': 会改变这些数值',
   html:d.table+'<div class="hint" style="margin-top:12px;line-height:1.8">'+note+'</div>',
   okText:'✔ 就换成这个',noText:'↩ 不换回去了',wide:true});
- if(go){MODE_CUR=to;toast('难度改成了'+d.to+', 点下面的「保存修改」才会真的写进 Commands.dat');}
+ if(go){MODE_CUR=to;toast('难度改成了'+d.to+', 点「游戏方式」卡片里的「💾 保存修改」才会真的写进 Commands.dat');}
  else{var back=modeRadio(from);if(back)back.checked=true;}
  if(window.dirtyCheck)dirtyCheck();}
 /* 进度恢复: 页面重开/刷新时, steamcmd 还在跑就接着显示进度条 */
@@ -6064,6 +6945,7 @@ hintIds();
 # ================================================================ 存档管理 (备份 / 删除)
 def page_saves():
     inv = save_inventory()
+    unit_list = save_unit_dirs()
     sd = server_dir()
     suggested = os.path.join(BASE_DIR, "存档备份")
 
@@ -6077,39 +6959,47 @@ def page_saves():
                     f'<td class="hint">{esc(r["mtime"])}</td></tr>')
         return out or '<tr><td colspan="5" class="hint">这个文件夹里没有存档文件</td></tr>'
 
-    def grp_html(gid, title, sub, files):
-        return f"""<div class="sv" id="{gid}">
+    def units_for(kind, name):
+        """这一组对应的「整个存档文件夹」(带地图名那一层), 整体备份和导入都按它走"""
+        low = (name or "").lower()
+        return [u["rel"] for u in unit_list
+                if u["kind"] == kind and (u["map"] if kind == "level" else u["id"]).lower() == low]
+
+    def grp_html(gid, title, sub, files, urels):
+        return f"""<div class="sv" id="{gid}" data-units="{esc(','.join(urels))}">
 <div class="svh"><b>{title}</b><span class="hint">{sub}</span><span class="sp"></span>
 <button class="btn sm gray" onclick="pickAll('{gid}',true)">全选</button>
 <button class="btn sm gray" onclick="pickAll('{gid}',false)">取消全选</button>
-<button class="btn sm" onclick="backup('{gid}','all')">📦 整体备份</button>
-<button class="btn sm" onclick="backup('{gid}','sel')">⬇ 备份勾选</button>
+<button class="btn sm" onclick="backupU('{gid}')" title="连地图名那一层文件夹一起整份复制, 这种备份才能拿回来导入">📦 整体备份</button>
+<button class="btn sm gray" onclick="backup('{gid}','sel')" title="只复制勾选的那几个文件 —— 这种残缺备份不能用于导入">⬇ 备份勾选</button>
 <button class="btn sm red" onclick="del('{gid}')">🗑 备份后删除勾选</button></div>
 <table><tr><th style="width:34px"></th><th>文件</th><th>这是什么存档</th><th>大小</th><th>最后保存</th></tr>
 {file_rows(files)}</table></div>"""
 
     lv_html = "".join(
         grp_html(f"L{n}", f"🏠 地图 {esc(g['map'])}",
-                 f"{len(g['files'])} 个建筑存档文件 · 共 {human_size(g['size'])}", g["files"])
+                 f"整个文件夹 Level\\{esc(g['map'])} · {len(g['files'])} 个建筑存档文件 · 共 {human_size(g['size'])}",
+                 g["files"], units_for("level", g["map"]))
         for n, g in enumerate(inv["level"])) or \
         '<div class="hint">这个存档还没有建筑存档文件 (Level 文件夹是空的) — 开服并进游戏建东西后回来看看。</div>'
 
     pl_html = "".join(
         grp_html(f"P{n}", f"🧑 玩家 {esc(p['id'])}",
                  f"地图 {'/'.join(map(esc, p['maps'])) or '—'} · {len(p['files'])} 个文件 · 共 {human_size(p['size'])}",
-                 p["files"])
+                 p["files"], units_for("player", p["id"]))
         for n, p in enumerate(inv["players"])) or \
         '<div class="hint">还没有玩家进过服 (Players 文件夹是空的), 所以没有玩家存档可备份。</div>'
 
     allp = "PALL"
+    all_player_units = ",".join(u["rel"] for u in unit_list if u["kind"] == "player")
     if inv["players"]:
-        pl_html = f"""<div id="{allp}">
+        pl_html = f"""<div id="{allp}" data-units="{esc(all_player_units)}">
 <div class="svh" style="margin-bottom:10px"><b>👥 全部玩家 ({len(inv['players'])} 人)</b>
-<span class="hint">整体备份所有人的玩家存档; 删除则是先备份再删掉这些人的存档</span>
+<span class="hint">整体备份所有人的玩家存档 (连各自的地图文件夹一起带走); 删除则是先备份再删掉这些人的存档</span>
 <span class="sp"></span>
 <button class="btn sm gray" onclick="pickAll('{allp}',true)">全选</button>
 <button class="btn sm gray" onclick="pickAll('{allp}',false)">取消全选</button>
-<button class="btn sm" onclick="backup('{allp}','all')">📦 整体备份全部玩家</button>
+<button class="btn sm" onclick="backupU('{allp}')">📦 整体备份全部玩家</button>
 <button class="btn sm red" onclick="del('{allp}')">🗑 备份后删除勾选</button></div>
 {pl_html}</div>"""
 
@@ -6129,11 +7019,12 @@ def page_saves():
 
 <div class="card"><h2>① 备份要保存在哪里 (自己选)</h2>
 <div class="desc">选一个文件夹就行, 桌面、其他盘、移动硬盘都可以。每次备份都会在里面新建一个
-「{esc(instance())}_备份_年月日_时分秒」子文件夹, 文件夹内部保持 Level / Players 的原目录结构, 不会覆盖你上一次的备份。</div>
+「{esc(instance())}_整体备份_地图名_年月日_时分秒」子文件夹, 里面保持 Level / Players 的原目录结构
+(连<b>地图名那一层文件夹</b>一起带走, 只有这种备份才能在下面第④步认得出是哪张地图的档、才允许导回来), 不会覆盖你上一次的备份。</div>
 <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
 <input class="f" id="dest" style="flex:1;min-width:300px" placeholder="例如 D:\\我的存档备份"
  value="{esc(suggested)}">
-<button class="btn gray" onclick="browse()">📂 浏览文件夹…</button></div>
+<button class="btn gray" onclick="browse('dest')">📂 浏览文件夹…</button></div>
 <div class="hint" id="lastbk"></div></div>
 
 <div class="card"><h2>② 建筑存档 · Level</h2>
@@ -6147,6 +7038,36 @@ def page_saves():
 <div class="hint" style="margin-bottom:8px">当前位置: <code class="k">{esc(os.path.join(sd, 'Players'))}</code>
  · 想知道哪个 ID 是谁: 开服后在「控制台 → 在线玩家」里对照即可</div>
 {pl_html}</div>
+
+<div class="card"><h2>④ 导入 / 恢复存档 (把备份放回服务器)</h2>
+<div class="desc">选中一个<b>备份文件夹</b> (不是里面的某个文件), 先「检查」再「导入」。
+开服器会认出这份备份是哪张地图的存档, 对得上才让你导。</div>
+<div class="banner warn block">
+<p><b class="hl">地图必须对得上。</b>建筑存档是按地图分文件夹存的
+(<code class="k">Level\\地图名\\</code>、<code class="k">Players\\SteamID\\地图名\\</code>),
+当前服务器开的是 <b class="hl">{esc(cmd_info().get('map') or '未设置')}</b> ——
+拿别的地图的备份导进来, 建筑会落到错的地图上, 所以这种情况会被直接拒掉。</p>
+<p><b class="hl">只收整体备份。</b>单个 <code class="k">Barricades.dat</code> /
+<code class="k">Structures.dat</code> 这类文件不接: 它们记的是同一张地图上互相咬合的几份数据,
+只换一个进去会让建筑错位甚至整张地图存档废掉。确实要手工替换, 请自己打开上面那个路径去放,
+先手工拷一份原件出来, 出了问题只能自己还原。</p>
+<p><b class="hl">导入前会自动备份。</b>当前服务器上要被覆盖的那份存档 (玩家档尤其重要),
+会先整体复制到上面填的备份目录, 然后才开始写入; 中途任何一步失败, 自动退回导入前的状态。</p>
+<p>请先<b class="hl">关服</b>再导入 —— 服务器运行中导进去的档, 会在关服自动保存时被旧数据盖回去。</p></div>
+<div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
+<input class="f" id="src" style="flex:1;min-width:300px" placeholder="要导入的备份文件夹, 例如 D:\\我的存档备份\\{esc(instance())}_整体备份_…">
+<button class="btn gray" onclick="browse('src')">📂 浏览文件夹…</button>
+<button class="btn" onclick="checkBk()">🔍 先检查这个文件夹</button></div>
+<div class="hint" id="bkinfo" style="margin-top:10px"></div>
+<div style="margin-top:10px"><button class="btn" id="impbtn" disabled onclick="doImport()">⬆ 导入到这个存档</button>
+<span class="hint">检查通过后这个按钮才会亮</span></div></div>
+
+<div class="card"><h2>⑤ 备份目录里现成的备份</h2>
+<div class="desc">列一下上面那个备份目录里都有些什么, 标好每份是<b>哪张地图</b>、<b>是不是整体备份</b>、
+和当前服务器<b>对不对得上</b>。想退回某个时间点, 直接点那一份的「用它导入」即可
+(恢复和导入是同一件事, 一样会先备份当前存档)。</div>
+<div style="margin-top:10px"><button class="btn gray" onclick="loadBks()">🔄 刷新这份列表</button></div>
+<div class="hint" id="bklist" style="margin-top:10px">点上面刷新即可。</div></div>
 """
     script = """
 function destPath(){var d=document.getElementById('dest'),v=d.value.trim();
@@ -6164,6 +7085,59 @@ async function backup(g,mode){
  toast('正在备份 '+items.length+' 个存档文件…');
  var r=await post('/api/saves/backup',{items:items,dest:d});
  toast(r.msg,r.ok?0:1);if(r.ok)setLast(r.dest);}
+async function backupU(g){
+ var el=document.getElementById(g);
+ var us=(el&&el.dataset.units?el.dataset.units:'').split(',').filter(function(s){return s});
+ if(!us.length){toast('这一组里没找到完整的存档文件夹 (地图名那一层)',1);return;}
+ var d=destPath();if(!d)return;
+ toast('正在整体备份 '+us.length+' 个存档文件夹…');
+ var r=await post('/api/saves/backup_units',{units:us,dest:d});
+ toast(r.msg,r.ok?0:1);if(r.ok){setLast(r.dest);loadBks();}}
+function bkInfo(t,warn){var e=document.getElementById('bkinfo');if(!e)return;
+ e.innerHTML=t;e.className='hint'+(warn?' red':'');e.style.color=warn?'#ff6b6b':'';}
+async function checkBk(path){
+ var p=path||document.getElementById('src').value.trim();
+ var btn=document.getElementById('impbtn');if(btn)btn.disabled=true;
+ if(!p){toast('先选一个备份文件夹',1);return;}
+ bkInfo('正在检查 '+p+' …');
+ var r=await post('/api/saves/inspect',{path:p});
+ if(r.ok){bkInfo('✔ '+r.msg);if(btn)btn.disabled=false;}
+ else bkInfo('✖ '+r.msg,1);
+ return r;}
+async function doImport(){
+ var p=document.getElementById('src').value.trim();if(!p){toast('先选备份文件夹',1);return;}
+ var r=await checkBk(p);if(!r||!r.ok){toast('这个文件夹没通过检查, 不能导入',1);return;}
+ var go=await modal({icon:'⬆',title:'导入前请确认这三件事',
+  body:'要导入: '+p+'\\n落到当前存档 (地图 '+(r.cur_map||'未设置')+')\\n\\n'+
+       '1) 必须先关服, 否则导进去的内容会被游戏盖回去。\\n'+
+       '2) 当前服务器上会被覆盖的存档 (含每个玩家的档), 会先整体备份到 '+destPath()+'。\\n'+
+       '3) 只导入 '+r.importable.length+' 个对得上的存档单元; 地图不符或散文件会被跳过。\\n\\n确定开始导入?',
+  okText:'先备份当前, 再导入',noText:'取消',danger:true});
+ if(!go)return;
+ toast('正在备份当前存档并导入…');
+ var x=await post('/api/saves/import',{src:p,dest:destPath(),confirm:true});
+ toast(x.msg,x.ok?0:1);
+ if(x.ok){if(x.pre)setLast(x.pre);setTimeout(function(){location.reload();},2800);}}
+function esc1(s){return String(s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]});}
+async function loadBks(){
+ var d=destPath();
+ var r=await post('/api/saves/backups',{dest:d});
+ var e=document.getElementById('bklist');if(!e)return;
+ if(!r.ok){e.textContent=r.msg||'读不出这个目录';return;}
+ if(!r.items.length){e.textContent='这个目录里还没有备份文件夹 (先点上面的「📦 整体备份」)。当前位置: '+r.dest;return;}
+ e.innerHTML='<div class="hint">备份目录: '+esc1(r.dest)+' · 当前服务器地图: '+esc1(r.cur_map||'未设置')+'</div>';
+ r.items.forEach(function(x){
+  var row=document.createElement('div');row.className='trow';
+  var tag=x.match?'<span style="color:#4ade80">✔ 地图对得上</span>':'<span style="color:#ff6b6b">✘ 地图不是当前这张</span>';
+  row.innerHTML='<div style="flex:1;min-width:0"><b>'+esc1(x.name)+'</b>'
+   +'<div class="ds">'+esc1(x.mtime)+' · 地图 '+esc1((x.maps||[]).join('/')||'没认出来')
+   +' · '+x.files+' 个文件 · '+esc1(x.size_cn||'—')
+   +(x.whole?'':' · ⚠ 不是整体备份 (散文件, 不能导入)')+'</div>'
+   +'<div class="ds">'+tag+(x.from_tool?' · 本工具备份':' · 手工整理的文件夹')+'</div></div>';
+  var b=document.createElement('button');b.className='btn sm';b.textContent='用它导入';
+  b.onclick=function(){document.getElementById('src').value=x.path;checkBk(x.path);
+   window.scrollTo(0,document.getElementById('src').getBoundingClientRect().top+window.scrollY-120);};
+  row.appendChild(b);e.appendChild(row);});}
 async function del(g){
  var items=picked(g);
  if(!items.length){toast('先勾选要删除的存档文件 (删除必须先勾选)',1);return;}
@@ -6178,10 +7152,12 @@ async function del(g){
  var r=await post('/api/saves/delete',{items:items,dest:d,confirm:true});
  toast(r.msg,r.ok?0:1);
  if(r.ok){pickAll(g,false);setLast(r.dest);setTimeout(function(){location.reload();},2600);}}
-function browse(){
+function browse(who){
+ var tgt=who||'dest';
  var m=document.createElement('div');m.className='mask';
  var box=document.createElement('div');box.className='modal-box wide';
- var h=document.createElement('h3');h.textContent='📂 选择备份保存的文件夹';
+ var h=document.createElement('h3');
+ h.textContent=tgt==='src'?'📂 选中要导入的备份文件夹 (选到文件夹本身, 不是里面的文件)':'📂 选择备份保存的文件夹';
  var path=document.createElement('div');path.className='dpath';
  var list=document.createElement('div');list.className='dirlist';
  var bt=document.createElement('div');bt.className='mbtns';
@@ -6206,7 +7182,8 @@ function browse(){
  no.onclick=function(){m.remove();};
  ok.onclick=function(){
   if(!st.cwd){toast('先进入一个文件夹再确定',1);return;}
-  document.getElementById('dest').value=st.cwd;m.remove();};
+  document.getElementById(tgt).value=st.cwd;m.remove();
+  if(tgt==='src')checkBk(st.cwd);};
  m.addEventListener('click',function(e){if(e.target===m)m.remove();});
  show('');}
 """
@@ -6219,8 +7196,16 @@ def page_console():
 <div class="card"><h2>控制台通道体检</h2>
 <div class="desc">网页上的<b>发送命令 / 刷新玩家列表 / 安全关服</b>都走 Rocket 的 RCON 通道。
 这一栏会直接告诉你卡在哪一环: Rocket 没装好、服务器进程已经崩了、还是配置被覆盖。
-<b>发指令失败时这里也会自动更新</b>, 不用自己猜。</div>
-<div id="rkline" class="hint" style="margin-top:10px">正在体检…</div>
+<b>发指令失败时这里也会自动更新</b>, 不用自己猜。<br>
+<b class="hl">服务器没在运行的时候, 这里只会平静地写一句「没有在运行」</b> ——
+不会红字吓人说什么崩了 (v0.1.21 起)。<b>打开这一页也不会自动往服务器发探测指令</b>,
+完整结论要点下面那颗「🔍 重新体检」才出。<br>
+<b>玩着玩着指令突然全都发不出去?</b> Rocket 最多只肯同时开 10 条 RCON 连接, 占满了就全部拒收。
+在服务器那个黑色控制台窗口里输入 <code class="k">rflush y</code> 就能清空这些连接立刻恢复
+（光标点进窗口直接打字 + 回车；那个窗口能打字是 v0.1.18-beta 才修好的）
+—— 这是 Rocket 自带的指令, <b>不用重启服务器, 世界和存档都不受影响</b>。
+想知道是谁占着连接就输 <code class="k">rwho</code>, 单踢某一条用 <code class="k">rkick 编号</code>。</div>
+<div id="rkline" class="hint" style="margin-top:10px">正在看服务器开没开…</div>
 <div id="rkev" class="hint" style="opacity:.72;margin-top:6px;word-break:break-all"></div>
 <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
 <button class="btn sm gray" onclick="rkDiag()">🔍 重新体检</button>
@@ -6264,10 +7249,23 @@ def page_console():
 {check_html(ident="f_err", label="只看报错/警告", style="margin-left:14px")}
 </h2>
 <div class="term" id="term"></div>
-<div class="hint" id="logsrc"></div>
+<div class="hint" id="logsrc">日志源: {esc(_log_source_label(_log_source()))}</div>
 <div class="hint">实时滚动 · <span style="color:#fca5a5">红色</span>=报错
-<span style="color:#fde047">黄色</span>=警告 <span style="color:#6ee7b7">绿色</span>=服务器代码 · 来自 Rocket 日志;
-刚装完 Rocket 或刚开服时日志需要等服务器完全启动后才会出现, 服务器自己的黑色控制台窗口里始终有实时输出</div>
+<span style="color:#fde047">黄色</span>=警告 <span style="color:#6ee7b7">绿色</span>=服务器代码 ·
+来自游戏自己写到 Logs\\Server_存档名.log 里的日志, 存档名在「服务器设置」页可以看;
+刚开服时这份日志要等服务器完全启动后才会出现, 那个黑色控制台窗口里始终有实时输出,
+也可以直接在那个窗口里打字下指令 (v0.1.18-beta 起)</div>
+<div class="banner info block" style="margin-top:10px">
+<b class="t">ℹ️ 下面这几行是开服器自己在查询, 属正常行为, 不用处理</b>
+<p><code class="k">Client ID: n has executed command "players"</code> —— 网页要显示「当前玩家 N」,
+每 60 秒通过 Rocket 的 RCON 查一次在线玩家, 每查一次游戏就回这么一行。
+你在网页上发的<b>每一条指令</b>也会留下同样格式的一行 (引号里是你发的那条)。</p>
+<p><code class="k">Client ID: n has disconnected! (IP: 127.0.0.1:xxxxx)</code> —— 上面那次查询完就自己断开了。
+地址是 <b class="hl">127.0.0.1</b> (就是你自己这台机器), <b>不是朋友掉线</b>; 朋友真的掉线,
+日志里出现的是他的<b>玩家名 / SteamID</b>, 不会是这种本机地址。</p>
+<p><code class="k">Failed to find any players.</code> —— 这一句就是那次查询的回答: <b>当时服里没人在</b>。</p>
+<p>这几行只会占用日志的位置, <b>不影响服务器、不影响联机、也不是报错</b>。
+日志太吵就勾上面的「只看报错/警告」, 想留全就照原样放着。</p></div>
 <div class="banner info block" style="margin-top:10px">
 <b class="t">ℹ️ 启动服务器时出现报错和警告属于正常行为</b>
 <p>Unturned 服务端启动阶段本身会打印一些红字/黄字信息, 只要服务器能正常开服、朋友能进服就没有影响。</p>
@@ -6288,22 +7286,28 @@ async function poll(){
  r.lines.forEach(line);lastIdx=r.last;
  if(r.lines.length&&auto)term.scrollTop=term.scrollHeight;
  if(r.src!==undefined){var ls=document.getElementById('logsrc');
- if(ls)ls.textContent='日志源: '+(r.src.console?'控制台中继 console.log':r.src.rocket?'Rocket 日志':'暂无日志文件 — 服务器完全启动后生成; 若一直为空请安装 Rocket 并重启服务器');}
+ if(ls)ls.textContent='日志源: '+(r.src.label||'暂无日志文件 — 服务器完全启动后生成');}
  applyFilter();}catch(e){}}
 function applyFilter(){var only=document.getElementById('f_err').checked;
  term.querySelectorAll('.l').forEach(l=>{l.style.display=(only&&l.dataset.err!=='1')?'none':'';});}
 var fe=document.getElementById('f_err');if(fe)fe.addEventListener('change',applyFilter);
-async function rkDiag(){
+async function rkDiag(probe){
  var box=document.getElementById('rkline'),ev=document.getElementById('rkev');
  if(!box)return;
- box.textContent='体检中…';
+ if(probe===undefined)probe=true;
+ box.textContent=probe?'体检中…':'正在看服务器开没开…';
  var r;
- try{r=await (await fetch('/api/rcon/diag')).json();}
+ try{r=await (await fetch('/api/rcon/diag?probe='+(probe?1:0))).json();}
  catch(e){box.textContent='体检没能跑起来: '+e;return;}
- if(r.ok){box.innerHTML='<span style="color:#6ee7b7">✅ RCON 端口通了, 网页控制台可以正常发指令</span>'
-  +' · 游戏目录里 Rocket 文件 '+(r.rocket&&r.rocket.files||0)+' 个';}
- else{box.innerHTML='<span style="color:#fca5a5">⚠ '+ (r.msg||'连不上服务器') + '</span>';}
- if(ev)ev.textContent='证据: '+(r.evidence||'');
+ /* idle=没开服, wait=在跑但没探测, ok/full/warn 才需要下结论 */
+ var L=r.level||(r.ok?'ok':'warn');
+ if(L==='idle')box.innerHTML='<span style="color:#93a4c3">ℹ '+(r.msg||'服务器没有在运行')+'</span>';
+ else if(L==='wait')box.innerHTML='<span style="color:#93a4c3">ℹ '+(r.msg||'服务器在运行, 还没体检')+'</span>';
+ else if(r.ok)box.innerHTML='<span style="color:#6ee7b7">✅ RCON 端口通了, 网页控制台可以正常发指令</span>'
+  +' · 游戏目录里 Rocket 文件 '+(r.rocket&&r.rocket.files||0)+' 个';
+ else if(L==='full')box.innerHTML='<span style="color:#fcd34d">🟡 '+(r.msg||'RCON 连接位被占满了')+'</span>';
+ else box.innerHTML='<span style="color:#fca5a5">⚠ '+ (r.msg||'连不上服务器') + '</span>';
+ if(ev)ev.textContent=probe?'证据: '+(r.evidence||''):'';
 }
 async function rkFix(){
  var box=document.getElementById('rkline');
@@ -6357,7 +7361,7 @@ function renderPlayers(players,raw){
   box.appendChild(row);});
 }
 document.getElementById('cmd').addEventListener('keydown',e=>{if(e.key==='Enter')send();});
-poll();setInterval(poll,1500);rkDiag();
+poll();setInterval(poll,1500);rkDiag(false);   /* 打开页面只做状态询问, 不发探测指令 —— 完整结论要点「重新体检」 */
 """
     return shell("term", "控制台", content, script)
 
@@ -6395,10 +7399,34 @@ def page_help():
 <b>联机模式请不要使用来路不明的插件</b> —— 它们可能带病毒, 也可能直接把存档搞坏,
 到时候丢的是所有人的建筑和进度。</div></div>
 
-<div class="sosqq">遇到上面四条都没覆盖的特殊问题, 加开发者 QQ <b>2497194220</b> 私聊问询。
-<b>添加好友时请把问题一并写明</b>(报的是哪句错、从什么时候开始、是服务器进不去还是客户端崩了),
-我看到了都会回复。</div>
+<div class="sosqq"><b>[开发者告知]</b> 在使用<b>原版开服功能</b>或<b>更改配置选项</b>的过程中出现报错、卡住,
+加开发者 QQ <b>2497194220</b> 私聊。<br>
+· 我<b>只修复程序本身的问题</b>。<b>联机问题</b>按反馈统计下来<b>基本都是自己的网络环境或者配置填错了</b>,
+不是程序的问题 —— 这种要我陪你一项一项排查的<b>需要收费</b>;
+<b>如果查下来确实是程序本身的问题, 那就免费</b>, 直接修。<br>
+· 这一点先说清楚: 本程序<b>不会影响 Unturned 本体的正常游玩</b>, <b>不会引起反作弊 (VAC / BattlEye 战眼)
+的错误问题</b>, 也<b>不会往 C 盘下载东西</b> —— 除非你本身就把开服端放在 C 盘或桌面里。<br>
+· 加好友时请把问题一并写明 (报的是哪句错、从什么时候开始、是服务器进不去还是客户端崩了), 我看到了都会回复。<br>
+<b>请在使用本程序前了解一些计算机知识</b> —— 路径、文件夹、端口这些看得懂, 能帮你少走一大圈弯路。</div>
 </div>
+
+<div class="card"><h2>🎮 玩到一半指令突然全都发不出去 (v0.1.18 起)</h2>
+<div class="desc">现象很好认: 服务器明明还好好的, 朋友还在里面跑, 但网页上发什么指令都没反应,
+「控制台」页体检那栏写着<b>Rocket 的 RCON 连接位已经被占满</b>。<br><br>
+<b>为什么会这样</b>: 网页发给服务器的每一条指令都要占用 Rocket 的一条 RCON 连接,
+而它最多只肯同时开 <b>10 条</b>。连接位被占死之后每条指令都被直接拒收,
+所以问题总是<b>「玩了一段时间才出现」</b> —— 不是你点错了, 是通道被塞满了。<br>
+<b>不用重启服务器的解法</b>: 切到那个黑色的服务器控制台窗口, 直接输入
+<code class="k">rflush y</code> 回车。这是 Rocket 自带的指令, 一次把所有占着的 RCON 连接踢掉,
+网页指令当场恢复, <b>世界、建筑、玩家进度全都不受影响</b>。<br>
+想先看是谁占着就输 <code class="k">rwho</code> (列出每条连接的编号和地址),
+只踢某一条用 <code class="k">rkick 编号</code>。<br>
+<b>如果那个窗口打不进字</b> (v0.1.18-beta 之前的老版本): 敲下去的字母一个都不显示, 这不是你的电脑、
+也不是输入法的问题 —— 旧版开服器把服务器输出接走了, 服务器就不读键盘了。<b>升级到 v0.1.18-beta 起</b>
+服务器自己拥有那个窗口, 打字、回车都正常; 老版本当时只能靠关服重开把连接位清干净。<br>
+<b>v0.1.18 已经堵住源头</b>: 指令改为发完就规规矩矩收尾 (不再趁服务器还在写的时候把连接撕掉)、
+全站指令排队执行、后台人数刷新拉长到 60 秒且连续失败三次自动停工。
+真按这三条改完还是占满的话, 网页会把上面这句解法直接显示给你, 不用自己猜。</div></div>
 
 <div class="card"><h2>第一次开服 (3 步)</h2>
 <div class="desc" style="line-height:2.1">
@@ -6547,10 +7575,12 @@ Steam 会自动把你的<b>游戏本体</b>更新到最新, 但<b>开服端不�
 <code class="k">-nographics</code> — 不加载显卡渲染, 省资源 (推荐勾选)<br>
 <code class="k">原版控制台窗口</code> (推荐开启) — 服务器以原版方式启动, 有自己独立的黑色控制台窗口;<br>
 　　　　<b>关闭开服器 / 关闭网页后, 服务器会一直在后台运行</b>, 想关服回来点「关服」或在服务器窗口按 Ctrl+C<br>
+　　　　这个黑色窗口<b>可以打字下指令</b> (v0.1.18-beta 起): 光标点进窗口, 敲 <code class="k">rflush y</code>、
+<code class="k">players</code>、<code class="k">shutdown</code> 然后回车, 打出来的字会留在屏幕上<br>
 　　　　关闭此选项则完全后台静默运行, 网页「运行日志」会更完整<br>
 <code class="k">关闭 bat 窗口时同时关闭服务器</code> — 默认关闭 (服务器驻留); 打开后关掉 bat 窗口会自动保存并关闭服务器<br>
 <code class="k">自定义参数</code> — 其他官方支持的启动参数写在这里, 用空格分隔; 不确定就不要填<br>
-<span class="hint">这一块有<b>自己的「保存启动参数」按钮</b>, 和上面的「保存修改」是分开的;
+<span class="hint">这一块有<b>自己的「保存启动参数」按钮</b>, 和上面「游戏方式」卡片里那颗「💾 保存修改」是分开的;
 红框那一栏<b>记住你开没点开</b>, 这次点开了, 下次回到这页还是开着的。</span>
 </div></div>
 
@@ -6578,14 +7608,36 @@ Steam 会自动把你的<b>游戏本体</b>更新到最新, 但<b>开服端不�
 · 控制台里输入 <code class="k">rocket reload</code> 可以重载插件
 </div></div>
 
+<div class="card"><h2>仪表盘那三格「这台机器的负担」是什么 (v0.1.19 起)</h2>
+<div class="desc" style="line-height:2.1">
+· <b>内存 (总 / 还剩)</b>: 这台机器一共多大内存、此刻还剩多少能用。开服的卡顿多半先看这格 ——
+剩得越少越容易进图慢、地图卡、服务端越跑越占<br>
+· <b>本机 CPU 占用</b>: 整台机器的 CPU 用了多少 (所有核心合在一起算)<br>
+· <b>服务端进程</b>: 只有这个开服器点起来的服务器进程本身占了多少 CPU 和内存; 没在运行时显示「没在运行」<br>
+· 这三格的数据来自 <b>Windows 自己的系统计数</b>, 和任务管理器同源, 每 4 秒跟着刷新一次<br>
+· <b>不会碰反作弊</b>: 只查系统占用, 不读游戏进程的内存内容、不注入、不往游戏里塞任何东西,
+也不会去数游戏加载了哪些文件 —— 这三样才是 VAC / 战眼会当成可疑的动作。
+而且服务器走的是 <code class="k">-batchmode -nographics</code> 官方开服端, 反作弊本身跑在玩家客户端上<br>
+· 如果这台机器<b>总内存 ≤8G 而且本局开的是创意工坊地图</b>, 仪表盘顶部会有一条提醒,
+写着这张地图在存档里实际占多大、订阅了多少个模组。这是提醒不是限制:
+小地图在 8G 机器上照样跑得动, 真吃内存的往往是模组数量而不是地图本身
+</div></div>
+
 <div class="card"><h2>存档备份 / 删除 (存档管理页)</h2>
 <div class="desc" style="line-height:2.1">
 · 存档文件是<b>加密的</b>, 人工打不开 —— 这一页只告诉你每个文件是什么, 你按名字勾选即可<br>
 · <b>建筑存档</b> = <code class="k">Servers\\存档名\\Level\\地图名\\</code>: 房子、地基墙门、场景物件、停着的车、光照等<br>
 · <b>玩家存档</b> = <code class="k">Servers\\存档名\\Players\\SteamID_0\\</code>: 物品栏、技能、血量、任务、穿着等<br>
 · 备份位置<b>完全由你自己选</b> (点「📂 浏览文件夹」挑一个), 每次备份新建
-<code class="k">存档名_备份_年月日_时分秒</code> 子文件夹, 不覆盖上次备份<br>
-· 可以<b>整体备份</b>一个地图 / 一个玩家 / 全部玩家, 也可以只勾几个文件<b>单个备份</b><br>
+<code class="k">存档名_整体备份_地图名_年月日_时分秒</code> 子文件夹, 不覆盖上次备份<br>
+· 「📦 整体备份」连<b>地图名那一层文件夹</b>一起带走, 并在里面写一份 <code class="k">备份清单.json</code>
+记下这是哪张地图、是不是整体 —— 只有这种备份能拿回来导入<br>
+· <b>导入 / 恢复</b>在同一个页面: 选中备份文件夹先「🔍 检查」, 对不上当前地图、或者只有几个散文件的,
+会被直接拒收; 通过检查后导入前会先把当前存档 (含每个玩家的档) 整体备份一份, 中途失败自动退回<br>
+· 单个 <code class="k">Barricades.dat</code> / <code class="k">Structures.dat</code> 这类文件<b>不能单独导入</b> ——
+它们记的是同一张地图上互相咬合的数据, 只换一个进去建筑会错位甚至报错。
+真要手工替换只能自己打开 <code class="k">Level\\地图名\\</code> 去放, 先自己拷一份原件出来<br>
+· 可以<b>整体备份</b>一个地图 / 一个玩家 / 全部玩家, 也可以只勾几个文件<b>单个备份</b> (但那种不能用来导入)<br>
 · 文件名带 <code class="k">~</code> 的是游戏自己留的<b>上一次保存的旧版本</b><br>
 · <b>删除一定会先备份</b>: 备份成功后才删, 备份失败则一个文件都不动;<br>
 　　　　删除只删你勾选的那几个文件, <b>不会删除 Level / Players 文件夹</b>, 空文件夹原样保留<br>
@@ -6669,6 +7721,9 @@ Steam 会自动把你的<b>游戏本体</b>更新到最新, 但<b>开服端不�
 「🔧 高级配置」—— 官方 Config.txt 里剩下的 191 项都在里面, 顶部有关键词筛选框;
 那一块<b>有自己独立的保存按钮</b>, 填完别只点上面那个「保存全部修改」<br>
 <b>设置改了没保存, 切个页面就白改了?</b> 「服务器设置」和「玩法设置」已经加了防呆, 不用再担心保存按钮藏得深:
+<b>「服务器设置」页从 v0.1.21 起只有一颗保存按钮</b>, 就在<b>「游戏方式」卡片里</b>（原先页面最底下那颗重复的删掉了,
+两个按钮摆在一页里反而让人怀疑它们各管一半）。点它一次会把基础信息、游戏方式、其他配置项一起写进同一份
+<code class="k">Commands.dat</code>;
 只要有改动没保存, 右下角会一直挂着「⚠ 有 N 处修改还没保存」, 改过的卡片描上黄边;
 这时候点侧边栏换页、点「▶ 开服 / 🔄 重启」、甚至刷新网页, 都会先弹窗问你要怎么办 ——
 <b>💾 先保存再继续</b> (替你按下各块的保存按钮再走) / <b>🗑 取消更改</b> (把页面恢复成保存前的样子再走) /
@@ -7372,6 +8427,7 @@ class Handler(BaseHTTPRequestHandler):
                 "setup": setup_done(),
                 "rocket": rocket_status(), "cheat": cheat_enabled(),
                 "maxplayers": info["maxplayers"],
+                "machine": machine_stats(),
                 "instance": instance(), "game_dir": game_dir()})
         if u.path == "/setup":
             return self._html(page_setup())
@@ -7404,9 +8460,12 @@ class Handler(BaseHTTPRequestHandler):
             page = page_edit(qs.get("path", [""])[0])
             return self._html(page if page else "<h1>文件不存在</h1>", 200 if page else 404)
         if u.path == "/api/rcon/diag":
-            why, ev = rcon_diag()
+            # probe=0: 只问"服务器开没开", 不发 RCON 探测 (页面刚打开走这一档)
+            probe = parse_qs(u.query).get("probe", ["1"])[0] != "0"
+            why, ev = rcon_diag(probe=probe)
             return self._json({"ok": bool(ev["listening"]),
                                "listening": bool(ev["listening"]),
+                               "level": ev.get("level", "warn"),
                                "running": server_running()[0], "msg": why,
                                "evidence": ev["evidence"],
                                "rocket": rocket_status()})
@@ -7414,14 +8473,16 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/console":
             _push_log_tails()
             after = int(parse_qs(u.query).get("after", ["0"])[0])
-            sd = server_dir()
-            has_clog = bool(sd) and os.path.isfile(os.path.join(sd, "console.log"))
-            has_rlog = bool(sd) and os.path.isfile(os.path.join(sd, "Rocket", "Logs", "Rocket.log"))
+            kind = _log_source()
             with _proc_lock:
                 lines = [d for d in _console if d["i"] > after]
                 last = _console_idx[0]
             return self._json({"lines": lines, "last": last,
-                               "src": {"console": has_clog, "rocket": has_rlog}})
+                               "src": {"console": kind == "console",
+                                       "rocket": kind == "rocket",
+                                       "server": kind == "server",
+                                       "kind": kind,
+                                       "label": _log_source_label(kind)}})
         if u.path == "/api/oplog":
             cat = parse_qs(u.query).get("cat", [""])[0]
             lines = [l for l in read_oplog() if not cat or f"[{cat}]" in l]
@@ -7589,12 +8650,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "players": [], "raw": "",
                                    "msg": "服务器没有在运行"})
             try:
-                resp = rcon_command("players")
+                resp = players_now(force=True)
             except (OSError, RconError) as e:
                 why, ev = rcon_diag()
                 oplog("错误", f"刷新玩家列表失败: {e} | {ev['evidence']}")
                 return self._json({"ok": False, "players": [], "raw": "",
-                                   "msg": f"获取失败: {e} —— {why}"})
+                                   "msg": (str(e) if rcon_is_full()
+                                           else f"获取失败: {e} —— {why}")})
             players = parse_players(resp)
             _write_title_file(len(players))
             oplog("操作", f"刷新玩家列表: {len(players)} 人在线")
@@ -7674,6 +8736,24 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg, target = delete_saves(items, str(body.get("dest", ""))[:500])
             return self._json({"ok": ok, "msg": msg, "dest": target})
 
+        if u.path == "/api/saves/backup_units":
+            rels = [str(x)[:400] for x in body.get("units", [])][:200]
+            ok, msg, target = backup_unit_dirs(rels, str(body.get("dest", ""))[:500])
+            return self._json({"ok": ok, "msg": msg, "dest": target})
+
+        if u.path == "/api/saves/backups":
+            return self._json(list_backups(str(body.get("dest", ""))[:500]))
+
+        if u.path == "/api/saves/inspect":
+            return self._json(inspect_backup(str(body.get("path", ""))[:500]))
+
+        if u.path == "/api/saves/import":
+            rels = [str(x)[:400] for x in body.get("units", [])][:200] or None
+            ok, msg, pre = import_backup(str(body.get("src", ""))[:500],
+                                         str(body.get("dest", ""))[:500],
+                                         rels, bool(body.get("confirm")))
+            return self._json({"ok": ok, "msg": msg, "pre": pre})
+
         if u.path == "/api/file":
             full = safe_path(str(body.get("path", "")))
             if not full:
@@ -7723,14 +8803,22 @@ class Handler(BaseHTTPRequestHandler):
                 if k in seen or k in ("pvp", "pve"):
                     continue
                 entries.append({"key": k, "value": v, "comment": ""})
-            # PVP/PVE 互斥: 只有当本次提交包含其中之一时才重写, 否则保留原行
+            # PVP/PVE 互斥: 只有当本次提交包含其中之一时才重写, 否则保留原行。
+            # 原位改写而不是"删掉再追加到文件末尾" —— 旧写法会让这一行跳到最底下,
+            # 上面那句 //PVE 或 PVP 注释变成空挂, 用户看着像没写进去。
             if "pvp" in kv or "pve" in kv:
-                entries = [e for e in entries
-                           if not (e["key"] and e["key"].lower() in ("pvp", "pve"))]
-                if kv.get("pvp") == "" and kv.get("pve") != "":
-                    entries.append({"key": "PVP", "value": "", "comment": ""})
-                elif kv.get("pve") == "":
-                    entries.append({"key": "PVE", "value": "", "comment": "//PVE 或 PVP"})
+                want = "PVP" if "pvp" in kv else "PVE"
+                kept, rewritten = [], False
+                for e in entries:
+                    if e["key"] and e["key"].lower() in ("pvp", "pve"):
+                        if rewritten:
+                            continue        # 文件里同时挂着 PVP 和 PVE 时只留一行
+                        e["key"], e["value"] = want, ""
+                        rewritten = True
+                    kept.append(e)
+                if not rewritten:
+                    kept.append({"key": want, "value": "", "comment": "//PVE 或 PVP"})
+                entries = kept
             write_file(commands_path(), build_commands(entries))
             if "map" in kv:
                 oplog("操作", f"保存服务器设置 (Commands.dat) · 地图 = {kv['map']}")

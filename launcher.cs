@@ -11,8 +11,8 @@ using System.Reflection;
 [assembly: AssemblyCompany("Pippl")]
 [assembly: AssemblyProduct("Dawn Sharkk")]
 [assembly: AssemblyCopyright("Copyright © 2026 snowPippl · MIT License")]
-[assembly: AssemblyVersion("__VERSION__.0")]
-[assembly: AssemblyFileVersion("__VERSION__.0")]
+[assembly: AssemblyVersion("__BUILDVER__.0")]
+[assembly: AssemblyFileVersion("__BUILDVER__.0")]
 [assembly: AssemblyInformationalVersion("__VERSION__")]
 
 namespace DawnSharkk
